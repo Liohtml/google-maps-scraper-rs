@@ -1,0 +1,149 @@
+# google-maps-scraper
+
+[![crates.io](https://img.shields.io/crates/v/google-maps-scraper.svg)](https://crates.io/crates/google-maps-scraper)
+[![docs.rs](https://docs.rs/google-maps-scraper/badge.svg)](https://docs.rs/google-maps-scraper)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+Apify-style Google Maps scraper for Rust. Drives a real headless Chrome via the Chrome DevTools Protocol — no API key required.
+
+## Why
+
+Until now there has been **no production-quality Rust crate** for scraping Google Maps. The official Places API is paid, and Apify is JavaScript-only. This crate fills the gap with the same approach used by Apify's `compass~crawler-google-places` actor, written natively in Rust.
+
+## Features
+
+- 🌍 Search Google Maps with arbitrary text queries.
+- 🔄 Auto-scrolls the results feed until exhausted.
+- 🪟 Clicks each result to grab address + phone + website from the panel.
+- 🚪 Auto-dismisses the cookie consent banner on first visit.
+- 🛡️ Sets `--disable-blink-features=AutomationControlled` to reduce detection.
+- 📦 Returns clean `Place` structs with German address parsing built-in.
+
+## Requirements
+
+- Chrome / Chromium installed locally.
+  - macOS: detected at `/Applications/Google Chrome.app/...`.
+  - Linux: `apt install chromium-browser`.
+  - Windows: detected in `Program Files`.
+- Override the binary location with the `CHROME` env var if needed.
+
+## Installation
+
+```toml
+[dependencies]
+google-maps-scraper = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+## Quick start
+
+```rust,no_run
+use google_maps_scraper::{MapsScraper, ScraperConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let scraper = MapsScraper::launch(ScraperConfig::default()).await?;
+
+    let places = scraper.search("coffee shop Berlin").await?;
+    for p in &places {
+        println!("{} – {:?} – {:?}", p.name, p.website, p.phone);
+    }
+    Ok(())
+}
+```
+
+## Multiple queries in one session
+
+```rust,no_run
+# use google_maps_scraper::{MapsScraper, ScraperConfig};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let scraper = MapsScraper::launch(ScraperConfig::default()).await?;
+let places = scraper.search_many(&[
+    "bakery Munich",
+    "bakery Hamburg",
+    "bakery Frankfurt",
+]).await?;
+println!("{} unique places across all 3 queries", places.len());
+# Ok(()) }
+```
+
+Results are automatically deduplicated by website domain (or maps URL when no website).
+
+## Configuration
+
+```rust,no_run
+# use google_maps_scraper::{MapsScraper, ScraperConfig};
+# use std::time::Duration;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let cfg = ScraperConfig {
+    headless: false,                       // see Chrome window for debugging
+    max_scroll_iterations: 50,             // load more results
+    enrich: true,                          // click each place for website/phone
+    between_query_delay: Duration::from_secs(3),
+    place_panel_delay: Duration::from_millis(2000),
+};
+let scraper = MapsScraper::launch(cfg).await?;
+# Ok(()) }
+```
+
+Set `enrich: false` for a 5–10× speedup if you only need names + maps URLs (no website / phone).
+
+## What you get back
+
+```rust
+pub struct Place {
+    pub name: String,
+    pub address: Option<String>,
+    pub postcode: Option<String>,        // German format detection
+    pub city: Option<String>,
+    pub phone: Option<String>,
+    pub website: Option<String>,
+    pub maps_url: Option<String>,
+    pub source_query: Option<String>,
+}
+```
+
+`Place` derives `Serialize` + `Deserialize` so you can write straight to JSONL.
+
+## Examples
+
+```bash
+cargo run --example scrape_one
+```
+
+## Anti-detection caveats
+
+Google detects bot traffic. Rough survival guide:
+
+- 🟢 1–30 queries per session: usually fine.
+- 🟡 30–100 queries: feed may start returning empty. Restart the browser between batches.
+- 🔴 100+ queries from one IP: expect to be soft-banned (search returns 0 results). Use a residential proxy or [Browserless](https://www.browserless.io/) cloud Chrome.
+
+The crate ships with the most reliable selectors at the time of writing. Google's DOM shifts occasionally — file an issue if the scraper stops returning data.
+
+## Comparison with alternatives
+
+| Tool | Lang | Pricing | Notes |
+|---|---|---|---|
+| Google Places API | any | $32/1000 + $17/1000 details | Official; paid. Full coverage. |
+| Apify `compass~crawler-google-places` | JS | $5/1000 results | Battle-tested. Requires Apify account. |
+| **google-maps-scraper** | Rust | **$0** | Self-hosted; brittler; this crate. |
+| `googlescraper` (Python) | Python | $0 | Less maintained. |
+
+## Roadmap
+
+- Headed-mode debugging helper that opens DevTools.
+- Built-in residential-proxy support via `BROWSERLESS_URL`.
+- Concurrent multi-page scraping inside one browser.
+- Stealth plugin (`puppeteer-extra-plugin-stealth`-equivalent).
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

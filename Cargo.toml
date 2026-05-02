@@ -1,0 +1,30 @@
+[package]
+name = "google-maps-scraper"
+version = "0.1.0"
+edition = "2024"
+authors = ["Lionel Machire <lionel.machire@googlemail.com>"]
+description = "Apify-style Google Maps scraper for Rust — drive a real Chrome via CDP, search by query + scroll the results feed, click each place, extract name/address/phone/website. No API key needed."
+documentation = "https://docs.rs/google-maps-scraper"
+repository = "https://github.com/Liohtml/google-maps-scraper-rs"
+homepage = "https://github.com/Liohtml/google-maps-scraper-rs"
+readme = "README.md"
+keywords = ["google-maps", "scraper", "headless-chrome", "places", "lead-generation"]
+categories = ["web-programming", "api-bindings"]
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[dependencies]
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+tokio = { version = "1", features = ["time", "macros", "rt", "sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1.10"
+url = "2.5"
+urlencoding = "2.1"
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
