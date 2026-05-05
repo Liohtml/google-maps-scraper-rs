@@ -159,6 +159,12 @@ cargo run --example scrape_obscura
 cargo run --example scrape_one
 ```
 
+## Known Limitations
+
+**Google Maps requires Chrome.** Google Maps is an extremely complex SPA (Angular + WebComponents + WebGL) that requires a full browser engine to render any DOM content. Obscura can navigate to the correct URL and bypass the consent banner, but the Maps app renders zero interactive DOM elements without full CSS layout, Custom Elements, and WebGL support.
+
+**Use `ScraperConfig::default()` (Chrome) for Google Maps scraping.** The Obscura backend is ready for when Obscura adds fuller Web API support, and works well for simpler scraping targets.
+
 ## Anti-detection
 
 ### Obscura stealth (default)

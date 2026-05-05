@@ -4,6 +4,7 @@
 //! Requires the `obscura` binary on PATH or set via OBSCURA_BIN env var.
 
 use google_maps_scraper::{MapsScraper, ScraperConfig};
+use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,7 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let cfg = ScraperConfig::obscura();
+    let cfg = match env::var("OBSCURA_BIN") {
+        Ok(path) => ScraperConfig::obscura_at(path, 9222),
+        Err(_) => ScraperConfig::obscura(),
+    };
     let scraper = MapsScraper::launch(cfg).await?;
     let places = scraper.search("coffee shop Berlin").await?;
 
