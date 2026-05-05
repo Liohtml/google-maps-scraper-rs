@@ -1,6 +1,6 @@
 //! # google-maps-scraper
 //!
-//! Apify-style Google Maps scraper for Rust. Drives a headless browser
+//! Apify-style Google Maps scraper for Rust. Drives a real headless Chrome
 //! via the Chrome DevTools Protocol, searches Google Maps for any query,
 //! scrolls the results feed until exhaustion, then clicks each place card
 //! and extracts the public details (name, address, phone, website).
@@ -16,13 +16,9 @@
 //!
 //! ## Requirements
 //!
-//! **Obscura (recommended):** Download the
-//! [Obscura binary](https://github.com/h4ckf0r0day/obscura/releases)
-//! and place it on your `PATH`. No Chrome needed.
-//!
-//! **Chrome (legacy):** Chrome / Chromium installed locally. On macOS the
-//! auto-detect finds `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
-//! On Linux: `apt install chromium`. Override via the `CHROME` env var.
+//! - Chrome / Chromium installed locally. On macOS the auto-detect finds
+//!   `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
+//!   On Linux: `apt install chromium`. Override via the `CHROME` env var.
 //!
 //! ## Quick start
 //!
@@ -31,7 +27,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let scraper = MapsScraper::launch(ScraperConfig::obscura()).await?;
+//! let scraper = MapsScraper::launch(ScraperConfig::default()).await?;
 //!
 //! let places = scraper
 //!     .search_many(&["coffee shop Berlin", "bakery Munich"])
@@ -45,24 +41,23 @@
 //!
 //! ## Anti-detection notes
 //!
-//! Obscura's stealth mode includes fingerprint randomization, TLS mimicry
-//! (Chrome 145), tracker blocking (3,520 domains), and `navigator.webdriver`
-//! masking. For high-volume scraping use a residential proxy, slow down
-//! delays between queries, and don't reuse a single session for hundreds
-//! of queries.
+//! Google's bot-detection adapts. The `--disable-blink-features=AutomationControlled`
+//! flag is set by default. For high-volume scraping use a residential proxy /
+//! Browserless service, slow down delay between queries, and don't reuse a
+//! single browser session for hundreds of queries.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod cdp;
-
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 const SEARCH_URL_BASE: &str = "https://www.google.com/maps";
@@ -74,6 +69,8 @@ pub enum BrowserBackend {
     #[default]
     Chrome,
     /// Obscura headless browser — lightweight, stealthy, no Chrome needed.
+    /// The inner path points to the `obscura` binary. If `None`, looks for
+    /// `obscura` / `obscura.exe` on `$PATH`.
     Obscura {
         /// Path to the Obscura binary. Defaults to `"obscura"` (on PATH).
         bin: Option<PathBuf>,
@@ -183,101 +180,21 @@ impl ScraperConfig {
     }
 }
 
-// ───────── unified page driver (enum dispatch) ─────────
-
-enum Driver {
-    Chrome {
-        page: Page,
-        _browser: Browser,
-        _handler: tokio::task::JoinHandle<()>,
-    },
-    Obscura {
-        cdp: cdp::CdpPage,
-        _child: tokio::process::Child,
-    },
-}
-
-impl Driver {
-    async fn goto(&self, url: &str) -> Result<()> {
-        match self {
-            Driver::Chrome { page, .. } => {
-                page.goto(url).await.map_err(|e| Error::Page(e.to_string()))?;
-                Ok(())
-            }
-            Driver::Obscura { cdp, .. } => {
-                cdp.goto(url).await.map_err(Error::Page)
-            }
-        }
-    }
-
-    async fn evaluate_json(&self, js: &str) -> Result<serde_json::Value> {
-        match self {
-            Driver::Chrome { page, .. } => {
-                let val: serde_json::Value = page.evaluate(js).await?.into_value().unwrap_or_default();
-                Ok(val)
-            }
-            Driver::Obscura { cdp, .. } => {
-                cdp.evaluate(js).await.map_err(Error::Page)
-            }
-        }
-    }
-
-    async fn find_element_exists(&self, sel: &str) -> Result<bool> {
-        match self {
-            Driver::Chrome { page, .. } => Ok(page.find_element(sel).await.is_ok()),
-            Driver::Obscura { cdp, .. } => cdp.find_element(sel).await.map_err(Error::Page),
-        }
-    }
-
-    async fn click_selector(&self, sel: &str) -> Result<()> {
-        match self {
-            Driver::Chrome { page, .. } => {
-                if let Ok(el) = page.find_element(sel).await {
-                    let _ = el.click().await;
-                }
-                Ok(())
-            }
-            Driver::Obscura { cdp, .. } => cdp.click(sel).await.map_err(Error::Page),
-        }
-    }
-
-    /// Set Google consent cookies to bypass the consent redirect.
-    async fn set_consent_cookies(&self) {
-        match self {
-            Driver::Chrome { page, .. } => {
-                // Chrome: set via JS after navigating to google.com first.
-                let _ = page.goto("https://www.google.com").await;
-                let _ = page.evaluate(
-                    "document.cookie = 'CONSENT=YES+; domain=.google.com; path=/; max-age=63072000'"
-                ).await;
-                let _ = page.evaluate(
-                    "document.cookie = 'SOCS=CAESEwgDEgk2MDI1MDUwNA; domain=.google.com; path=/; max-age=63072000'"
-                ).await;
-            }
-            Driver::Obscura { cdp, .. } => {
-                let _ = cdp.set_cookies(&[
-                    ("CONSENT", "YES+", ".google.com"),
-                    ("SOCS", "CAESEwgDEgk2MDI1MDUwNA", ".google.com"),
-                ]).await;
-            }
-        }
-    }
-}
-
-// ───────── scraper ─────────
-
 /// The scraper. Holds an active browser process (Chrome or Obscura).
 ///
 /// Drop the scraper to close the browser.
 pub struct MapsScraper {
-    driver: Driver,
+    browser: Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+    /// If we spawned Obscura ourselves, keep the child so we can kill it.
+    obscura_child: Option<tokio::process::Child>,
     cfg: ScraperConfig,
 }
 
 impl MapsScraper {
     /// Launch a browser and return a ready-to-use scraper.
     ///
-    /// With `BrowserBackend::Chrome` this launches headless Chrome.
+    /// With `BrowserBackend::Chrome` this behaves exactly like before.
     /// With `BrowserBackend::Obscura` it spawns the Obscura binary in
     /// `serve --stealth` mode and connects via CDP WebSocket.
     pub async fn launch(cfg: ScraperConfig) -> Result<Self> {
@@ -312,17 +229,10 @@ impl MapsScraper {
 
         let handler_task = tokio::spawn(async move { while (handler.next().await).is_some() {} });
 
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| Error::Page(e.to_string()))?;
-
         Ok(Self {
-            driver: Driver::Chrome {
-                page,
-                _browser: browser,
-                _handler: handler_task,
-            },
+            browser,
+            handler_task,
+            obscura_child: None,
             cfg,
         })
     }
@@ -332,7 +242,8 @@ impl MapsScraper {
         bin: Option<PathBuf>,
         port: u16,
     ) -> Result<Self> {
-        let bin_path = bin.unwrap_or_else(|| PathBuf::from("obscura"));
+        let bin_path = bin
+            .unwrap_or_else(|| PathBuf::from("obscura"));
 
         info!(bin = %bin_path.display(), port, "starting Obscura");
 
@@ -342,14 +253,13 @@ impl MapsScraper {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                Error::ObscuraLaunch(format!(
-                    "failed to spawn {}: {e}. Is Obscura installed?",
-                    bin_path.display()
-                ))
-            })?;
+            .map_err(|e| Error::ObscuraLaunch(format!(
+                "failed to spawn {}: {e}. Is Obscura installed?",
+                bin_path.display()
+            )))?;
 
-        // Wait for Obscura to bind.
+        // Give Obscura a moment to bind the port.
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser");
         let mut connected = false;
         for attempt in 1..=20 {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -367,19 +277,18 @@ impl MapsScraper {
                 "Obscura did not start within 5 s on port {port}"
             )));
         }
-
-        let ws_url = format!("ws://127.0.0.1:{port}");
         info!("Obscura ready, connecting via {ws_url}");
 
-        let cdp_page = cdp::CdpPage::connect(&ws_url)
+        let (browser, mut handler) = Browser::connect(&ws_url)
             .await
-            .map_err(Error::ObscuraLaunch)?;
+            .map_err(|e| Error::ObscuraLaunch(format!("CDP connect failed: {e}")))?;
+
+        let handler_task = tokio::spawn(async move { while (handler.next().await).is_some() {} });
 
         Ok(Self {
-            driver: Driver::Obscura {
-                cdp: cdp_page,
-                _child: child,
-            },
+            browser,
+            handler_task,
+            obscura_child: Some(child),
             cfg,
         })
     }
@@ -392,32 +301,19 @@ impl MapsScraper {
     /// Run several queries through one browser session.
     /// Results are deduped by website domain (and by maps_url when no website).
     pub async fn search_many(&self, queries: &[&str]) -> Result<Vec<Place>> {
-        // Navigate to google.com first, set consent cookies, then go to maps.
-        self.driver.goto("https://www.google.com").await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Set consent cookies via JS on the google.com domain.
-        self.driver
-            .evaluate_json("document.cookie = 'CONSENT=YES+; domain=.google.com; path=/; max-age=63072000'")
+        let page = self
+            .browser
+            .new_page("about:blank")
             .await
-            .ok();
-        self.driver
-            .evaluate_json("document.cookie = 'SOCS=CAESEwgDEgk2MDI1MDUwNQ; domain=.google.com; path=/; max-age=63072000'")
-            .await
-            .ok();
+            .map_err(|e| Error::Page(e.to_string()))?;
 
-        // Also set via CDP if available.
-        self.driver.set_consent_cookies().await;
-
-        // Now navigate to Maps.
-        self.driver.goto("https://www.google.com/maps").await?;
+        // Visit the maps homepage once to handle the consent banner.
+        page.goto("https://www.google.com/maps").await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = dismiss_consent(&page).await;
 
-        // Check if we still landed on consent, handle it.
-        dismiss_consent(&self.driver).await;
-
-        let mut out: Vec<Place> = Vec::new();
-        let mut seen_keys: HashSet<String> = HashSet::new();
+        let out: Arc<Mutex<Vec<Place>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
@@ -426,26 +322,28 @@ impl MapsScraper {
                 SEARCH_URL_BASE,
                 urlencoding::encode(q)
             );
-            if let Err(e) = self.driver.goto(&url).await {
+            if let Err(e) = page.goto(&url).await {
                 warn!("goto error: {e}");
                 continue;
             }
             tokio::time::sleep(self.cfg.between_query_delay).await;
 
-            // Wait for results panel to appear.
-            let _ = self.driver.find_element_exists("div[role='feed']").await;
+            // Wait for results panel.
+            let _ = page.find_element("div[role='feed']").await;
 
-            // Scroll until stable.
-            let _ = scroll_feed(&self.driver, self.cfg.max_scroll_iterations).await;
+            // Scroll until stable
+            let _ = scroll_feed(&page, self.cfg.max_scroll_iterations).await;
 
-            // Collect place URLs in the feed.
-            let urls = collect_place_urls(&self.driver).await.unwrap_or_default();
+            // Collect place URLs in the feed
+            let urls = collect_place_urls(&page).await.unwrap_or_default();
             info!(found = urls.len(), "feed collected");
 
             if !self.cfg.enrich {
+                let mut o = out.lock().await;
+                let mut sk = seen_keys.lock().await;
                 for u in urls {
-                    if seen_keys.insert(u.clone()) {
-                        out.push(Place {
+                    if sk.insert(u.clone()) {
+                        o.push(Place {
                             name: String::new(),
                             maps_url: Some(u),
                             source_query: Some((*q).to_string()),
@@ -457,12 +355,12 @@ impl MapsScraper {
             }
 
             for place_url in urls {
-                if let Err(e) = self.driver.goto(&place_url).await {
+                if let Err(e) = page.goto(&place_url).await {
                     warn!("place goto: {e}");
                     continue;
                 }
                 tokio::time::sleep(self.cfg.place_panel_delay).await;
-                let detail = match extract_place_details(&self.driver).await {
+                let detail = match extract_place_details(&page).await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("extract: {e}");
@@ -474,13 +372,15 @@ impl MapsScraper {
                 let key = detail
                     .website_domain()
                     .unwrap_or_else(|| place_url.clone());
-                if !seen_keys.insert(key) {
+                let mut sk = seen_keys.lock().await;
+                if !sk.insert(key) {
                     continue;
                 }
+                drop(sk);
 
-                let (postcode, city) =
-                    parse_german_address(detail.address.as_deref().unwrap_or(""));
-                out.push(Place {
+                let (postcode, city) = parse_german_address(detail.address.as_deref().unwrap_or(""));
+                let mut o = out.lock().await;
+                o.push(Place {
                     name: detail.name.unwrap_or_default(),
                     address: detail.address,
                     postcode,
@@ -493,19 +393,18 @@ impl MapsScraper {
             }
         }
 
-        Ok(out)
+        let final_out = Arc::try_unwrap(out)
+            .map_err(|_| Error::Page("output Arc still held".into()))?
+            .into_inner();
+        Ok(final_out)
     }
 
     /// Close the browser cleanly. (Drop also works.)
-    pub async fn close(self) -> Result<()> {
-        match self.driver {
-            Driver::Chrome { mut _browser, _handler, .. } => {
-                let _ = _browser.close().await;
-                _handler.abort();
-            }
-            Driver::Obscura { mut _child, .. } => {
-                let _ = _child.kill().await;
-            }
+    pub async fn close(mut self) -> Result<()> {
+        let _ = self.browser.close().await;
+        self.handler_task.abort();
+        if let Some(mut child) = self.obscura_child.take() {
+            let _ = child.kill().await;
         }
         Ok(())
     }
@@ -535,68 +434,33 @@ impl PlaceDetailRaw {
     }
 }
 
-async fn dismiss_consent(driver: &Driver) {
-    // Check if we landed on the consent page.
-    let on_consent = driver
-        .evaluate_json("window.location.href.includes('consent.google')")
-        .await
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    if !on_consent {
-        // Try the in-page consent overlay (Chrome usually shows this).
-        let selectors = [
-            "button[aria-label*='Alle akzeptieren']",
-            "button[aria-label*='Accept all']",
-            "button[aria-label*='Reject all']",
-            "button[aria-label*='Alle ablehnen']",
-        ];
-        for sel in selectors {
-            if driver.find_element_exists(sel).await.unwrap_or(false) {
-                let _ = driver.click_selector(sel).await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                break;
-            }
+async fn dismiss_consent(page: &Page) {
+    let selectors = [
+        "button[aria-label*='Alle akzeptieren']",
+        "button[aria-label*='Alle ablehnen']",
+        "button[aria-label*='Accept all']",
+        "button[aria-label*='Reject all']",
+        "form[action*='consent.google.com'] button",
+    ];
+    for sel in selectors {
+        if let Ok(el) = page.find_element(sel).await {
+            let _ = el.click().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            break;
         }
-        return;
     }
-
-    // On the consent.google.com redirect page, submit the form via JS.
-    info!("consent page detected, accepting cookies");
-    let _ = driver
-        .evaluate_json(
-            r#"(() => {
-                const btn = document.querySelector("button[aria-label*='akzeptieren']")
-                    || document.querySelector("button[aria-label*='Accept']");
-                if (btn) { btn.click(); return 'clicked'; }
-                // Fallback: submit the first form that looks like consent.
-                const form = document.querySelector("form[action*='consent']");
-                if (form) { form.submit(); return 'submitted'; }
-                return 'not_found';
-            })()"#,
-        )
-        .await;
-
-    // Wait for the consent redirect to complete.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    // After consent, Obscura may still be on the consent page (form POST
-    // redirect). Navigate back to maps explicitly.
-    let _ = driver.goto("https://www.google.com/maps").await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
-async fn scroll_feed(driver: &Driver, max_iters: usize) -> Result<()> {
+async fn scroll_feed(page: &Page, max_iters: usize) -> Result<()> {
     let mut last_height = -1.0_f64;
     let mut stable = 0;
     for _ in 0..max_iters {
-        let new_height: f64 = driver
-            .evaluate_json(
+        let new_height: f64 = page
+            .evaluate(
                 "(() => { const f = document.querySelector(\"div[role='feed']\"); if (!f) return -1; f.scrollTop = f.scrollHeight; return f.scrollHeight; })()",
             )
             .await?
-            .as_f64()
+            .into_value()
             .unwrap_or(-1.0);
         if new_height < 0.0 {
             break;
@@ -615,16 +479,17 @@ async fn scroll_feed(driver: &Driver, max_iters: usize) -> Result<()> {
     Ok(())
 }
 
-async fn collect_place_urls(driver: &Driver) -> Result<Vec<String>> {
-    let raw = driver
-        .evaluate_json(
+async fn collect_place_urls(page: &Page) -> Result<Vec<String>> {
+    let raw: Vec<String> = page
+        .evaluate(
             "Array.from(document.querySelectorAll(\"div[role='feed'] a[href*='/maps/place/']\")).map(a => a.href)",
         )
-        .await?;
-    let urls: Vec<String> = serde_json::from_value(raw).unwrap_or_default();
+        .await?
+        .into_value()
+        .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for u in urls {
+    for u in raw {
         if seen.insert(u.clone()) {
             out.push(u);
         }
@@ -632,7 +497,7 @@ async fn collect_place_urls(driver: &Driver) -> Result<Vec<String>> {
     Ok(out)
 }
 
-async fn extract_place_details(driver: &Driver) -> Result<PlaceDetailRaw> {
+async fn extract_place_details(page: &Page) -> Result<PlaceDetailRaw> {
     let js = r#"
         (() => {
             const out = {};
@@ -652,7 +517,7 @@ async fn extract_place_details(driver: &Driver) -> Result<PlaceDetailRaw> {
             return out;
         })()
     "#;
-    let raw = driver.evaluate_json(js).await?;
+    let raw: serde_json::Value = page.evaluate(js).await?.into_value().unwrap_or_default();
     let mut d = PlaceDetailRaw::default();
     if let Some(s) = raw.get("name").and_then(|v| v.as_str()) {
         d.name = Some(s.to_string());
