@@ -50,7 +50,6 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,26 +57,9 @@ use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const SEARCH_URL_BASE: &str = "https://www.google.com/maps";
-
-/// Which browser backend to use.
-#[derive(Debug, Clone, Default)]
-pub enum BrowserBackend {
-    /// Standard headless Chrome (requires Chrome/Chromium installed).
-    #[default]
-    Chrome,
-    /// Obscura headless browser — lightweight, stealthy, no Chrome needed.
-    /// The inner path points to the `obscura` binary. If `None`, looks for
-    /// `obscura` / `obscura.exe` on `$PATH`.
-    Obscura {
-        /// Path to the Obscura binary. Defaults to `"obscura"` (on PATH).
-        bin: Option<PathBuf>,
-        /// CDP port Obscura listens on. Defaults to 9222.
-        port: u16,
-    },
-}
 
 /// All errors this crate produces.
 #[derive(Debug, thiserror::Error)]
@@ -85,10 +67,6 @@ pub enum Error {
     /// Chrome failed to launch (often: not installed, or missing libs on Linux).
     #[error("chrome launch failed: {0}")]
     ChromeLaunch(String),
-
-    /// Obscura failed to start.
-    #[error("obscura launch failed: {0}")]
-    ObscuraLaunch(String),
 
     /// Driving the page failed (navigation, evaluation, …).
     #[error("page error: {0}")]
@@ -126,10 +104,7 @@ pub struct Place {
 /// Scraper configuration.
 #[derive(Debug, Clone)]
 pub struct ScraperConfig {
-    /// Which browser backend to use. Default: Chrome.
-    pub backend: BrowserBackend,
     /// Run Chrome in headless mode (default: true). Use `false` for debugging.
-    /// Ignored when `backend` is `Obscura` (always headless).
     pub headless: bool,
     /// How many `scrollTop = scrollHeight` iterations to perform per search
     /// before assuming the feed is exhausted. Default: 30.
@@ -146,7 +121,6 @@ pub struct ScraperConfig {
 impl Default for ScraperConfig {
     fn default() -> Self {
         Self {
-            backend: BrowserBackend::default(),
             headless: true,
             max_scroll_iterations: 30,
             enrich: true,
@@ -156,59 +130,18 @@ impl Default for ScraperConfig {
     }
 }
 
-impl ScraperConfig {
-    /// Create a config that uses Obscura with stealth mode. No Chrome needed.
-    pub fn obscura() -> Self {
-        Self {
-            backend: BrowserBackend::Obscura {
-                bin: None,
-                port: 9222,
-            },
-            ..Default::default()
-        }
-    }
-
-    /// Create a config that uses Obscura at a specific binary path.
-    pub fn obscura_at(bin: impl Into<PathBuf>, port: u16) -> Self {
-        Self {
-            backend: BrowserBackend::Obscura {
-                bin: Some(bin.into()),
-                port,
-            },
-            ..Default::default()
-        }
-    }
-}
-
-/// The scraper. Holds an active browser process (Chrome or Obscura).
+/// The scraper. Holds an active Chrome browser process.
 ///
-/// Drop the scraper to close the browser.
+/// Drop the scraper to close Chrome.
 pub struct MapsScraper {
     browser: Browser,
     handler_task: tokio::task::JoinHandle<()>,
-    /// If we spawned Obscura ourselves, keep the child so we can kill it.
-    obscura_child: Option<tokio::process::Child>,
     cfg: ScraperConfig,
 }
 
 impl MapsScraper {
-    /// Launch a browser and return a ready-to-use scraper.
-    ///
-    /// With `BrowserBackend::Chrome` this behaves exactly like before.
-    /// With `BrowserBackend::Obscura` it spawns the Obscura binary in
-    /// `serve --stealth` mode and connects via CDP WebSocket.
+    /// Launch a Chrome browser and return a ready-to-use scraper.
     pub async fn launch(cfg: ScraperConfig) -> Result<Self> {
-        match &cfg.backend {
-            BrowserBackend::Chrome => Self::launch_chrome(cfg).await,
-            BrowserBackend::Obscura { bin, port } => {
-                let bin = bin.clone();
-                let port = *port;
-                Self::launch_obscura(cfg, bin, port).await
-            }
-        }
-    }
-
-    async fn launch_chrome(cfg: ScraperConfig) -> Result<Self> {
         let mut builder = BrowserConfig::builder()
             .arg("--lang=en-US,en")
             .arg("--no-first-run")
@@ -232,63 +165,6 @@ impl MapsScraper {
         Ok(Self {
             browser,
             handler_task,
-            obscura_child: None,
-            cfg,
-        })
-    }
-
-    async fn launch_obscura(
-        cfg: ScraperConfig,
-        bin: Option<PathBuf>,
-        port: u16,
-    ) -> Result<Self> {
-        let bin_path = bin
-            .unwrap_or_else(|| PathBuf::from("obscura"));
-
-        info!(bin = %bin_path.display(), port, "starting Obscura");
-
-        let child = tokio::process::Command::new(&bin_path)
-            .args(["serve", "--port", &port.to_string(), "--stealth"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| Error::ObscuraLaunch(format!(
-                "failed to spawn {}: {e}. Is Obscura installed?",
-                bin_path.display()
-            )))?;
-
-        // Give Obscura a moment to bind the port.
-        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser");
-        let mut connected = false;
-        for attempt in 1..=20 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            debug!(attempt, "probing Obscura CDP endpoint");
-            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-                .await
-                .is_ok()
-            {
-                connected = true;
-                break;
-            }
-        }
-        if !connected {
-            return Err(Error::ObscuraLaunch(format!(
-                "Obscura did not start within 5 s on port {port}"
-            )));
-        }
-        info!("Obscura ready, connecting via {ws_url}");
-
-        let (browser, mut handler) = Browser::connect(&ws_url)
-            .await
-            .map_err(|e| Error::ObscuraLaunch(format!("CDP connect failed: {e}")))?;
-
-        let handler_task = tokio::spawn(async move { while (handler.next().await).is_some() {} });
-
-        Ok(Self {
-            browser,
-            handler_task,
-            obscura_child: Some(child),
             cfg,
         })
     }
@@ -399,13 +275,10 @@ impl MapsScraper {
         Ok(final_out)
     }
 
-    /// Close the browser cleanly. (Drop also works.)
+    /// Close Chrome cleanly. (Drop also works.)
     pub async fn close(mut self) -> Result<()> {
         let _ = self.browser.close().await;
         self.handler_task.abort();
-        if let Some(mut child) = self.obscura_child.take() {
-            let _ = child.kill().await;
-        }
         Ok(())
     }
 }

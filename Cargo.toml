@@ -15,7 +15,7 @@ rust-version = "1.85"
 
 [dependencies]
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
-tokio = { version = "1", features = ["time", "macros", "rt", "sync", "process"] }
+tokio = { version = "1", features = ["time", "macros", "rt", "sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
