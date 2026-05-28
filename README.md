@@ -1,8 +1,9 @@
 # google-maps-scraper
 
-[![crates.io](https://img.shields.io/crates/v/google-maps-scraper.svg)](https://crates.io/crates/google-maps-scraper)
-[![docs.rs](https://docs.rs/google-maps-scraper/badge.svg)](https://docs.rs/google-maps-scraper)
+[![CI](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+> **Note:** This crate is not yet published on crates.io. Install it from git (see below).
 
 Apify-style Google Maps scraper for Rust. Drives a real headless Chrome via the Chrome DevTools Protocol — no API key required.
 
@@ -31,7 +32,7 @@ Until now there has been **no production-quality Rust crate** for scraping Googl
 
 ```toml
 [dependencies]
-google-maps-scraper = "0.1"
+google-maps-scraper = { git = "https://github.com/Liohtml/google-maps-scraper-rs" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -83,12 +84,18 @@ let cfg = ScraperConfig {
     enrich: true,                          // click each place for website/phone
     between_query_delay: Duration::from_secs(3),
     place_panel_delay: Duration::from_millis(2000),
+    max_places: Some(50),                  // cap unique places per query (None = unlimited)
+    nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
+    proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var
 };
 let scraper = MapsScraper::launch(cfg).await?;
 # Ok(()) }
 ```
 
 Set `enrich: false` for a 5–10× speedup if you only need names + maps URLs (no website / phone).
+
+For high-volume scraping, set `proxy` (or the `PROXY_URL` environment variable) to route
+Chrome through a residential proxy and reduce the chance of being soft-banned.
 
 ## What you get back
 
@@ -101,6 +108,8 @@ pub struct Place {
     pub phone: Option<String>,
     pub website: Option<String>,
     pub maps_url: Option<String>,
+    pub latitude: Option<f64>,           // parsed from the maps_url @lat,lng segment
+    pub longitude: Option<f64>,
     pub source_query: Option<String>,
 }
 ```
@@ -134,8 +143,11 @@ The crate ships with the most reliable selectors at the time of writing. Google'
 
 ## Roadmap
 
+- ✅ Proxy support via `ScraperConfig::proxy` / `PROXY_URL`.
+- ✅ Coordinates (`latitude` / `longitude`) parsed from the maps URL.
 - Headed-mode debugging helper that opens DevTools.
-- Built-in residential-proxy support via `BROWSERLESS_URL`.
+- Remote Chrome (Browserless) support via `BROWSERLESS_URL`.
+- Richer place data: rating, review count, category, opening hours ([#11](https://github.com/Liohtml/google-maps-scraper-rs/issues/11)).
 - Concurrent multi-page scraping inside one browser.
 - Stealth plugin (`puppeteer-extra-plugin-stealth`-equivalent).
 

@@ -1,12 +1,40 @@
 # Changelog
 
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
 ## [Unreleased]
+
+### Added
+- `Drop` implementation for `MapsScraper` so the CDP handler task is aborted
+  even when `close()` is not called (panic / early return).
+- `ScraperConfig::max_places` — cap the number of unique places returned per query.
+- `ScraperConfig::nav_timeout` — bound every page navigation / feed-wait step.
+- `ScraperConfig::proxy` (and `PROXY_URL` env fallback) — launch Chrome behind a proxy.
+- `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
+- GitHub Actions CI: build, test, and clippy on push / pull request.
+
+### Changed
+- Page navigations are wrapped in `tokio::time::timeout` and fail with a clear
+  error instead of hanging indefinitely.
+- Collected feed URLs are filtered to the `https://` scheme before navigation,
+  preventing `javascript:` / `data:` URL execution.
+- The German address regex is compiled once via `LazyLock` instead of on every call.
+- Upgraded `chromiumoxide` 0.7 → 0.9 and `thiserror` 1 → 2.
+
+### Fixed
+- The working tab opened in `search_many` is now closed before returning,
+  fixing a tab/memory leak when a scraper is reused for many searches.
 
 ## [0.1.0] - 2026-05-02
 
 ### Added
-- Initial release.
-- `ApifyClient` with builder API for poll interval, max wait, and API base.
-- `run_actor` returns a `RunHandle` with `wait_for_dataset` / `wait_for_status`.
-- Generic `fetch_dataset_items::<T>()` deserializes any item shape.
-- Multi-key fallback on submit failure.
+- Initial release of `google-maps-scraper`.
+- `MapsScraper::launch` — start a headless Chrome and return a scraper instance.
+- `MapsScraper::search` — scrape Google Maps for a single query.
+- `MapsScraper::search_many` — run multiple queries in one browser session with
+  deduplication by website domain (or maps URL when no website).
+- `ScraperConfig` — configure headless mode, scroll iterations, enrichment, and delays.
+- `Place` — structured output with name, address, postcode, city, phone, website, maps_url.
+- German postcode/city parsing via `parse_german_address`.
+- Cookie consent auto-dismiss for German and English Google interfaces.
