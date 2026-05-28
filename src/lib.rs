@@ -50,7 +50,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chromiumoxide::{Browser, BrowserConfig, Page};
@@ -97,6 +97,10 @@ pub struct Place {
     pub website: Option<String>,
     /// The Google Maps URL (`/maps/place/...`) of this entry.
     pub maps_url: Option<String>,
+    /// Latitude parsed from the `@lat,lng` segment of `maps_url`, if present.
+    pub latitude: Option<f64>,
+    /// Longitude parsed from the `@lat,lng` segment of `maps_url`, if present.
+    pub longitude: Option<f64>,
     /// The query that produced this hit.
     pub source_query: Option<String>,
 }
@@ -116,6 +120,14 @@ pub struct ScraperConfig {
     pub between_query_delay: Duration,
     /// Per-place delay after clicking (gives the panel time to render).
     pub place_panel_delay: Duration,
+    /// Maximum number of unique places to return per query.
+    /// `None` (default) means unlimited.
+    pub max_places: Option<usize>,
+    /// Timeout for each page navigation / JS evaluation step. Default: 30s.
+    pub nav_timeout: Duration,
+    /// Optional proxy passed to Chrome as `--proxy-server=<value>`.
+    /// If `None`, falls back to the `PROXY_URL` environment variable.
+    pub proxy: Option<String>,
 }
 
 impl Default for ScraperConfig {
@@ -126,6 +138,9 @@ impl Default for ScraperConfig {
             enrich: true,
             between_query_delay: Duration::from_secs(2),
             place_panel_delay: Duration::from_millis(1500),
+            max_places: None,
+            nav_timeout: Duration::from_secs(30),
+            proxy: None,
         }
     }
 }
@@ -151,6 +166,16 @@ impl MapsScraper {
             .arg("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
         if !cfg.headless {
             builder = builder.with_head();
+        }
+        // Proxy: explicit config field wins, otherwise fall back to PROXY_URL.
+        if let Some(proxy) = cfg
+            .proxy
+            .clone()
+            .or_else(|| std::env::var("PROXY_URL").ok())
+            .filter(|p| !p.is_empty())
+        {
+            info!(%proxy, "using proxy server");
+            builder = builder.arg(format!("--proxy-server={proxy}"));
         }
         let browser_cfg = builder
             .build()
@@ -184,7 +209,7 @@ impl MapsScraper {
             .map_err(|e| Error::Page(e.to_string()))?;
 
         // Visit the maps homepage once to handle the consent banner.
-        page.goto("https://www.google.com/maps").await?;
+        goto_with_timeout(&page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = dismiss_consent(&page).await;
 
@@ -193,45 +218,62 @@ impl MapsScraper {
 
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
-            let url = format!(
-                "{}/search/{}/",
-                SEARCH_URL_BASE,
-                urlencoding::encode(q)
-            );
-            if let Err(e) = page.goto(&url).await {
+            let url = format!("{}/search/{}/", SEARCH_URL_BASE, urlencoding::encode(q));
+            if let Err(e) = goto_with_timeout(&page, &url, self.cfg.nav_timeout).await {
                 warn!("goto error: {e}");
                 continue;
             }
             tokio::time::sleep(self.cfg.between_query_delay).await;
 
-            // Wait for results panel.
-            let _ = page.find_element("div[role='feed']").await;
+            // Wait for results panel (bounded so a stalled render can't hang us).
+            let _ =
+                tokio::time::timeout(self.cfg.nav_timeout, page.find_element("div[role='feed']"))
+                    .await;
 
             // Scroll until stable
             let _ = scroll_feed(&page, self.cfg.max_scroll_iterations).await;
 
-            // Collect place URLs in the feed
-            let urls = collect_place_urls(&page).await.unwrap_or_default();
+            // Collect place URLs in the feed. Only keep https:// links so a
+            // tampered DOM can't feed us a `javascript:` / `data:` URL to navigate to.
+            let urls: Vec<String> = collect_place_urls(&page)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|u| u.starts_with("https://"))
+                .collect();
             info!(found = urls.len(), "feed collected");
+
+            // Number of unique places added for *this* query, used to honor max_places.
+            let mut added_this_query = 0usize;
 
             if !self.cfg.enrich {
                 let mut o = out.lock().await;
                 let mut sk = seen_keys.lock().await;
                 for u in urls {
+                    if self.cfg.max_places.is_some_and(|m| added_this_query >= m) {
+                        break;
+                    }
                     if sk.insert(u.clone()) {
+                        let (latitude, longitude) = parse_coords_from_maps_url(&u);
                         o.push(Place {
                             name: String::new(),
                             maps_url: Some(u),
+                            latitude,
+                            longitude,
                             source_query: Some((*q).to_string()),
                             ..Default::default()
                         });
+                        added_this_query += 1;
                     }
                 }
                 continue;
             }
 
             for place_url in urls {
-                if let Err(e) = page.goto(&place_url).await {
+                if self.cfg.max_places.is_some_and(|m| added_this_query >= m) {
+                    break;
+                }
+                if let Err(e) = goto_with_timeout(&page, &place_url, self.cfg.nav_timeout).await {
                     warn!("place goto: {e}");
                     continue;
                 }
@@ -245,16 +287,16 @@ impl MapsScraper {
                 };
 
                 // Dedup key: prefer website domain, else maps_url.
-                let key = detail
-                    .website_domain()
-                    .unwrap_or_else(|| place_url.clone());
+                let key = detail.website_domain().unwrap_or_else(|| place_url.clone());
                 let mut sk = seen_keys.lock().await;
                 if !sk.insert(key) {
                     continue;
                 }
                 drop(sk);
 
-                let (postcode, city) = parse_german_address(detail.address.as_deref().unwrap_or(""));
+                let (postcode, city) =
+                    parse_german_address(detail.address.as_deref().unwrap_or(""));
+                let (latitude, longitude) = parse_coords_from_maps_url(&place_url);
                 let mut o = out.lock().await;
                 o.push(Place {
                     name: detail.name.unwrap_or_default(),
@@ -264,10 +306,17 @@ impl MapsScraper {
                     phone: detail.phone,
                     website: detail.website,
                     maps_url: Some(place_url),
+                    latitude,
+                    longitude,
                     source_query: Some((*q).to_string()),
                 });
+                added_this_query += 1;
             }
         }
+
+        // Best-effort: close the working tab so it doesn't leak for the
+        // lifetime of the browser when the scraper is reused.
+        let _ = page.close().await;
 
         let final_out = Arc::try_unwrap(out)
             .map_err(|_| Error::Page("output Arc still held".into()))?
@@ -280,6 +329,16 @@ impl MapsScraper {
         let _ = self.browser.close().await;
         self.handler_task.abort();
         Ok(())
+    }
+}
+
+impl Drop for MapsScraper {
+    /// Abort the CDP handler task if the scraper is dropped without an explicit
+    /// `close()` (e.g. on panic or early return). `chromiumoxide::Browser` has
+    /// its own `Drop` that signals Chrome to shut down, so this just makes sure
+    /// the background polling task does not outlive the scraper.
+    fn drop(&mut self) {
+        self.handler_task.abort();
     }
 }
 
@@ -305,6 +364,16 @@ impl PlaceDetailRaw {
                 .to_string(),
         )
     }
+}
+
+/// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
+/// complete within `timeout`. Prevents a stalled network/render from blocking
+/// the async task indefinitely.
+async fn goto_with_timeout(page: &Page, url: &str, timeout: Duration) -> Result<()> {
+    tokio::time::timeout(timeout, page.goto(url))
+        .await
+        .map_err(|_| Error::Page(format!("navigation timed out after {timeout:?}: {url}")))??;
+    Ok(())
 }
 
 async fn dismiss_consent(page: &Page) {
@@ -416,13 +485,29 @@ async fn extract_place_details(page: &Page) -> Result<PlaceDetailRaw> {
     Ok(d)
 }
 
+static GERMAN_ADDRESS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\d{5})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-/. ]{1,40})").unwrap());
+
 fn parse_german_address(addr: &str) -> (Option<String>, Option<String>) {
-    let re = regex::Regex::new(r"(\d{5})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-/. ]{1,40})").unwrap();
-    if let Some(cap) = re.captures(addr) {
+    if let Some(cap) = GERMAN_ADDRESS_RE.captures(addr) {
         return (
             cap.get(1).map(|m| m.as_str().to_string()),
             cap.get(2).map(|m| m.as_str().trim().to_string()),
         );
+    }
+    (None, None)
+}
+
+/// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
+/// e.g. `https://www.google.com/maps/place/.../@52.5200,13.4050,17z/...`.
+/// Returns `(None, None)` if the URL has no coordinate segment.
+fn parse_coords_from_maps_url(url: &str) -> (Option<f64>, Option<f64>) {
+    static COORDS_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"@(-?\d+\.\d+),(-?\d+\.\d+)").unwrap());
+    if let Some(cap) = COORDS_RE.captures(url) {
+        let lat = cap.get(1).and_then(|m| m.as_str().parse::<f64>().ok());
+        let lng = cap.get(2).and_then(|m| m.as_str().parse::<f64>().ok());
+        return (lat, lng);
     }
     (None, None)
 }
@@ -453,5 +538,27 @@ mod tests {
         assert!(c.headless);
         assert!(c.enrich);
         assert_eq!(c.max_scroll_iterations, 30);
+        assert_eq!(c.max_places, None);
+        assert!(c.proxy.is_none());
+    }
+
+    #[test]
+    fn parses_coords_from_maps_url() {
+        let url = "https://www.google.com/maps/place/Cafe/@52.5200066,13.404954,17z/data=abc";
+        let (lat, lng) = parse_coords_from_maps_url(url);
+        assert_eq!(lat, Some(52.5200066));
+        assert_eq!(lng, Some(13.404954));
+    }
+
+    #[test]
+    fn coords_negative_and_missing() {
+        let (lat, lng) =
+            parse_coords_from_maps_url("https://maps.google.com/.../@-33.8688,151.2093,15z");
+        assert_eq!(lat, Some(-33.8688));
+        assert_eq!(lng, Some(151.2093));
+        assert_eq!(
+            parse_coords_from_maps_url("https://example.com/no-coords"),
+            (None, None)
+        );
     }
 }
