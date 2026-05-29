@@ -14,6 +14,8 @@ All notable changes to this project are documented here. The format is based on
 - `ScraperConfig::browserless_url` (and `BROWSERLESS_URL` env fallback) — connect to a
   remote Chrome over the DevTools WebSocket instead of launching a local browser.
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
+- `Place::rating`, `Place::reviews_count`, `Place::category` — extracted from the detail
+  panel, with unit-tested `parse_rating` / `parse_reviews_count` helpers (locale-tolerant).
 - GitHub Actions CI: build, test, and clippy on push / pull request.
 
 ### Changed

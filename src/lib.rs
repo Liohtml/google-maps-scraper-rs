@@ -101,6 +101,12 @@ pub struct Place {
     pub latitude: Option<f64>,
     /// Longitude parsed from the `@lat,lng` segment of `maps_url`, if present.
     pub longitude: Option<f64>,
+    /// Average star rating (0.0–5.0) from the detail panel, if shown.
+    pub rating: Option<f32>,
+    /// Number of reviews backing the rating, if shown.
+    pub reviews_count: Option<u32>,
+    /// Primary business category (e.g. "Bakery"), if shown.
+    pub category: Option<String>,
     /// The query that produced this hit.
     pub source_query: Option<String>,
 }
@@ -343,6 +349,9 @@ impl MapsScraper {
                     maps_url: Some(place_url),
                     latitude,
                     longitude,
+                    rating: detail.rating,
+                    reviews_count: detail.reviews_count,
+                    category: detail.category,
                     source_query: Some((*q).to_string()),
                 });
                 added_this_query += 1;
@@ -385,6 +394,9 @@ struct PlaceDetailRaw {
     address: Option<String>,
     phone: Option<String>,
     website: Option<String>,
+    rating: Option<f32>,
+    reviews_count: Option<u32>,
+    category: Option<String>,
 }
 
 impl PlaceDetailRaw {
@@ -401,9 +413,6 @@ impl PlaceDetailRaw {
     }
 }
 
-/// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
-/// complete within `timeout`. Prevents a stalled network/render from blocking
-/// the async task indefinitely.
 /// Strip credentials from a URL so it is safe to log: removes any userinfo
 /// (`user:pass@`) and the query string (which may carry a `?token=...`).
 /// Falls back to `"<redacted>"` when the value does not parse as a URL.
@@ -419,6 +428,9 @@ fn redact_url(raw: &str) -> String {
     }
 }
 
+/// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
+/// complete within `timeout`. Prevents a stalled network/render from blocking
+/// the async task indefinitely.
 async fn goto_with_timeout(page: &Page, url: &str, timeout: Duration) -> Result<()> {
     tokio::time::timeout(timeout, page.goto(url))
         .await
@@ -506,6 +518,37 @@ async fn extract_place_details(page: &Page) -> Result<PlaceDetailRaw> {
                 || document.querySelector('[data-item-id="authority"] a')
                 || document.querySelector('a[aria-label*="Website"]');
             out.website = authority ? authority.href : null;
+
+            // Rating: the header block (.F7nice) holds the average score.
+            // Fall back to the aria-label of the star image.
+            const head = document.querySelector('div.F7nice');
+            let ratingText = head ? (() => {
+                const r = head.querySelector('span[aria-hidden="true"]');
+                return r ? r.textContent.trim() : null;
+            })() : null;
+            if (!ratingText) {
+                const star = document.querySelector('div[role="img"][aria-label*="star" i], span[role="img"][aria-label*="star" i], div[role="img"][aria-label*="Stern" i]');
+                if (star) ratingText = star.getAttribute('aria-label');
+            }
+            out.rating = ratingText;
+
+            // Review count: prefer an element whose aria-label mentions reviews
+            // (keeps it separate from the rating), else a parenthesised count.
+            let reviewsText = null;
+            const revEl = document.querySelector(
+                'button[aria-label*="review" i], button[aria-label*="Rezension" i], button[aria-label*="Bewertung" i], [aria-label*="reviews" i]'
+            );
+            if (revEl) reviewsText = revEl.getAttribute('aria-label');
+            if (!reviewsText && head) {
+                const m = head.textContent.match(/\(([\d.,   ]+)\)/);
+                if (m) reviewsText = m[1];
+            }
+            out.reviews = reviewsText;
+
+            // Category: the button next to the rating, or the labelled chip.
+            const cat = document.querySelector('button[jsaction*="category"]')
+                || document.querySelector('button.DkEaL');
+            out.category = cat ? cat.textContent.trim() : null;
             return out;
         })()
     "#;
@@ -531,6 +574,20 @@ async fn extract_place_details(page: &Page) -> Result<PlaceDetailRaw> {
     }
     if let Some(s) = raw.get("website").and_then(|v| v.as_str()) {
         d.website = Some(s.to_string());
+    }
+    d.rating = raw
+        .get("rating")
+        .and_then(|v| v.as_str())
+        .and_then(parse_rating);
+    d.reviews_count = raw
+        .get("reviews")
+        .and_then(|v| v.as_str())
+        .and_then(parse_reviews_count);
+    if let Some(s) = raw.get("category").and_then(|v| v.as_str()) {
+        let c = s.trim();
+        if !c.is_empty() {
+            d.category = Some(c.to_string());
+        }
     }
     Ok(d)
 }
@@ -560,6 +617,28 @@ fn parse_coords_from_maps_url(url: &str) -> (Option<f64>, Option<f64>) {
         return (lat, lng);
     }
     (None, None)
+}
+
+/// Parse a star rating out of a label such as `"4,5"`, `"4.5"`, `"4.5 stars"`
+/// or `"4,5 Sterne"`. Accepts `,` or `.` as the decimal separator and only
+/// returns values within the valid 0.0–5.0 range.
+fn parse_rating(text: &str) -> Option<f32> {
+    static RATING_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(\d+(?:[.,]\d+)?)").unwrap());
+    let cap = RATING_RE.captures(text)?;
+    let value: f32 = cap.get(1)?.as_str().replace(',', ".").parse().ok()?;
+    (0.0..=5.0).contains(&value).then_some(value)
+}
+
+/// Parse a review count out of a label such as `"1,234 reviews"`,
+/// `"1.234 Rezensionen"` or `"(1 234)"`. Thousands separators (`.`, `,`,
+/// spaces, and non-breaking spaces) are stripped before parsing.
+fn parse_reviews_count(text: &str) -> Option<u32> {
+    static REVIEWS_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\d[\d.,\u{00a0}\u{202f} ]*").unwrap());
+    let token = REVIEWS_RE.find(text)?.as_str();
+    let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -604,6 +683,28 @@ mod tests {
             "wss://chrome.browserless.io/"
         );
         assert_eq!(redact_url("not a url"), "<redacted>");
+    }
+
+    #[test]
+    fn parses_rating() {
+        assert_eq!(parse_rating("4,5"), Some(4.5));
+        assert_eq!(parse_rating("4.5"), Some(4.5));
+        assert_eq!(parse_rating("4.5 stars"), Some(4.5));
+        assert_eq!(parse_rating("4,5 Sterne"), Some(4.5));
+        assert_eq!(parse_rating("5"), Some(5.0));
+        // Out of range / no number -> None.
+        assert_eq!(parse_rating("12.0"), None);
+        assert_eq!(parse_rating("no rating"), None);
+    }
+
+    #[test]
+    fn parses_reviews_count() {
+        assert_eq!(parse_reviews_count("1,234 reviews"), Some(1234));
+        assert_eq!(parse_reviews_count("1.234 Rezensionen"), Some(1234));
+        assert_eq!(parse_reviews_count("(1\u{00a0}234)"), Some(1234));
+        assert_eq!(parse_reviews_count("7 reviews"), Some(7));
+        assert_eq!(parse_reviews_count("(42)"), Some(42));
+        assert_eq!(parse_reviews_count("no reviews yet"), None);
     }
 
     #[test]

@@ -134,6 +134,9 @@ pub struct Place {
     pub maps_url: Option<String>,
     pub latitude: Option<f64>,           // parsed from the maps_url @lat,lng segment
     pub longitude: Option<f64>,
+    pub rating: Option<f32>,             // average star rating (0.0–5.0)
+    pub reviews_count: Option<u32>,      // number of reviews
+    pub category: Option<String>,        // primary business category
     pub source_query: Option<String>,
 }
 ```
@@ -170,8 +173,9 @@ The crate ships with the most reliable selectors at the time of writing. Google'
 - ✅ Proxy support via `ScraperConfig::proxy` / `PROXY_URL`.
 - ✅ Coordinates (`latitude` / `longitude`) parsed from the maps URL.
 - ✅ Remote Chrome (Browserless) support via `ScraperConfig::browserless_url` / `BROWSERLESS_URL`.
+- ✅ Richer place data: rating, review count, category.
 - Headed-mode debugging helper that opens DevTools.
-- Richer place data: rating, review count, category, opening hours ([#11](https://github.com/Liohtml/google-maps-scraper-rs/issues/11)).
+- Opening hours extraction.
 - Concurrent multi-page scraping inside one browser.
 - Stealth plugin (`puppeteer-extra-plugin-stealth`-equivalent).
 
