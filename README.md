@@ -87,6 +87,7 @@ let cfg = ScraperConfig {
     max_places: Some(50),                  // cap unique places per query (None = unlimited)
     nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
     proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var
+    browserless_url: None,                 // or set BROWSERLESS_URL to use a remote Chrome
 };
 let scraper = MapsScraper::launch(cfg).await?;
 # Ok(()) }
@@ -96,6 +97,27 @@ Set `enrich: false` for a 5–10× speedup if you only need names + maps URLs (n
 
 For high-volume scraping, set `proxy` (or the `PROXY_URL` environment variable) to route
 Chrome through a residential proxy and reduce the chance of being soft-banned.
+
+## Remote Chrome (Browserless) — no local Chrome required
+
+If you don't have Chrome installed locally, point the scraper at a remote Chrome over
+the DevTools WebSocket. Set `browserless_url` (or the `BROWSERLESS_URL` environment
+variable) and `MapsScraper::launch` will `connect` to it instead of launching a browser:
+
+```rust,no_run
+# use google_maps_scraper::{MapsScraper, ScraperConfig};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let cfg = ScraperConfig {
+    browserless_url: Some("ws://localhost:3000".into()), // or wss://chrome.browserless.io?token=...
+    ..Default::default()
+};
+let scraper = MapsScraper::launch(cfg).await?;
+# Ok(()) }
+```
+
+When connecting to a remote Chrome, local launch arguments (`headless`, `proxy`, window
+size, user agent) are controlled by the remote endpoint — configure those there.
 
 ## What you get back
 
@@ -145,8 +167,8 @@ The crate ships with the most reliable selectors at the time of writing. Google'
 
 - ✅ Proxy support via `ScraperConfig::proxy` / `PROXY_URL`.
 - ✅ Coordinates (`latitude` / `longitude`) parsed from the maps URL.
+- ✅ Remote Chrome (Browserless) support via `ScraperConfig::browserless_url` / `BROWSERLESS_URL`.
 - Headed-mode debugging helper that opens DevTools.
-- Remote Chrome (Browserless) support via `BROWSERLESS_URL`.
 - Richer place data: rating, review count, category, opening hours ([#11](https://github.com/Liohtml/google-maps-scraper-rs/issues/11)).
 - Concurrent multi-page scraping inside one browser.
 - Stealth plugin (`puppeteer-extra-plugin-stealth`-equivalent).

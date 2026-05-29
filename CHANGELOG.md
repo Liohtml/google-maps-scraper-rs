@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format is based on
 - `ScraperConfig::max_places` — cap the number of unique places returned per query.
 - `ScraperConfig::nav_timeout` — bound every page navigation / feed-wait step.
 - `ScraperConfig::proxy` (and `PROXY_URL` env fallback) — launch Chrome behind a proxy.
+- `ScraperConfig::browserless_url` (and `BROWSERLESS_URL` env fallback) — connect to a
+  remote Chrome over the DevTools WebSocket instead of launching a local browser.
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
 - GitHub Actions CI: build, test, and clippy on push / pull request.
 

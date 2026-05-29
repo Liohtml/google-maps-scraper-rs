@@ -128,6 +128,14 @@ pub struct ScraperConfig {
     /// Optional proxy passed to Chrome as `--proxy-server=<value>`.
     /// If `None`, falls back to the `PROXY_URL` environment variable.
     pub proxy: Option<String>,
+    /// Optional WebSocket URL of a remote Chrome (e.g. a Browserless instance)
+    /// to connect to instead of launching a local browser. If `None`, falls
+    /// back to the `BROWSERLESS_URL` environment variable.
+    ///
+    /// When set, the browser is reached via `Browser::connect`, so local
+    /// launch arguments (`headless`, `proxy`, window size, user agent) are
+    /// controlled by the remote endpoint and ignored here.
+    pub browserless_url: Option<String>,
 }
 
 impl Default for ScraperConfig {
@@ -141,6 +149,7 @@ impl Default for ScraperConfig {
             max_places: None,
             nav_timeout: Duration::from_secs(30),
             proxy: None,
+            browserless_url: None,
         }
     }
 }
@@ -155,35 +164,61 @@ pub struct MapsScraper {
 }
 
 impl MapsScraper {
-    /// Launch a Chrome browser and return a ready-to-use scraper.
+    /// Launch (or connect to) a Chrome browser and return a ready-to-use scraper.
+    ///
+    /// If [`ScraperConfig::browserless_url`] is set (or the `BROWSERLESS_URL`
+    /// environment variable is present), this connects to that remote Chrome
+    /// over the DevTools WebSocket instead of launching a local browser — handy
+    /// when no local Chrome is available or for high-volume scraping through a
+    /// managed Chrome service.
     pub async fn launch(cfg: ScraperConfig) -> Result<Self> {
-        let mut builder = BrowserConfig::builder()
-            .arg("--lang=en-US,en")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--window-size=1280,1024")
-            .arg("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
-        if !cfg.headless {
-            builder = builder.with_head();
-        }
-        // Proxy: explicit config field wins, otherwise fall back to PROXY_URL.
-        if let Some(proxy) = cfg
-            .proxy
+        // Remote Chrome (Browserless): explicit config field wins, else env var.
+        let remote = cfg
+            .browserless_url
             .clone()
-            .or_else(|| std::env::var("PROXY_URL").ok())
-            .filter(|p| !p.is_empty())
-        {
-            info!(%proxy, "using proxy server");
-            builder = builder.arg(format!("--proxy-server={proxy}"));
-        }
-        let browser_cfg = builder
-            .build()
-            .map_err(|e| Error::ChromeLaunch(e.to_string()))?;
+            .or_else(|| std::env::var("BROWSERLESS_URL").ok())
+            .filter(|u| !u.is_empty());
 
-        let (browser, mut handler) = Browser::launch(browser_cfg)
-            .await
-            .map_err(|e| Error::ChromeLaunch(e.to_string()))?;
+        let (browser, mut handler) = if let Some(ws_url) = remote {
+            info!(endpoint = %ws_url, "connecting to remote Chrome");
+            if cfg.proxy.is_some() || std::env::var("PROXY_URL").is_ok() {
+                warn!(
+                    "proxy config is ignored when connecting to a remote Chrome; \
+                     configure the proxy on the remote endpoint instead"
+                );
+            }
+            Browser::connect(ws_url)
+                .await
+                .map_err(|e| Error::ChromeLaunch(e.to_string()))?
+        } else {
+            let mut builder = BrowserConfig::builder()
+                .arg("--lang=en-US,en")
+                .arg("--no-first-run")
+                .arg("--no-default-browser-check")
+                .arg("--disable-blink-features=AutomationControlled")
+                .arg("--window-size=1280,1024")
+                .arg("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+            if !cfg.headless {
+                builder = builder.with_head();
+            }
+            // Proxy: explicit config field wins, otherwise fall back to PROXY_URL.
+            if let Some(proxy) = cfg
+                .proxy
+                .clone()
+                .or_else(|| std::env::var("PROXY_URL").ok())
+                .filter(|p| !p.is_empty())
+            {
+                info!(%proxy, "using proxy server");
+                builder = builder.arg(format!("--proxy-server={proxy}"));
+            }
+            let browser_cfg = builder
+                .build()
+                .map_err(|e| Error::ChromeLaunch(e.to_string()))?;
+
+            Browser::launch(browser_cfg)
+                .await
+                .map_err(|e| Error::ChromeLaunch(e.to_string()))?
+        };
 
         let handler_task = tokio::spawn(async move { while (handler.next().await).is_some() {} });
 
@@ -540,6 +575,7 @@ mod tests {
         assert_eq!(c.max_scroll_iterations, 30);
         assert_eq!(c.max_places, None);
         assert!(c.proxy.is_none());
+        assert!(c.browserless_url.is_none());
     }
 
     #[test]
