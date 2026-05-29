@@ -631,12 +631,32 @@ fn parse_rating(text: &str) -> Option<f32> {
 }
 
 /// Parse a review count out of a label such as `"1,234 reviews"`,
-/// `"1.234 Rezensionen"` or `"(1 234)"`. Thousands separators (`.`, `,`,
+/// `"1.234 Rezensionen"`, `"(1 234)"`, or a combined string like
+/// `"4.7 stars from 1,234 reviews"`. The number adjacent to a review keyword
+/// is preferred (so the rating is not mistaken for the count), then a
+/// parenthesised count, then any number. Thousands separators (`.`, `,`,
 /// spaces, and non-breaking spaces) are stripped before parsing.
 fn parse_reviews_count(text: &str) -> Option<u32> {
-    static REVIEWS_RE: LazyLock<regex::Regex> =
+    static COUNT_BEFORE_REVIEW_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(\d[\d.,\u{00a0}\u{202f} ]*)\s*(?:reviews?|rezensionen|bewertungen?)",
+        )
+        .unwrap()
+    });
+    static PAREN_COUNT_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\((\d[\d.,\u{00a0}\u{202f} ]*)\)").unwrap());
+    static ANY_COUNT_RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\d[\d.,\u{00a0}\u{202f} ]*").unwrap());
-    let token = REVIEWS_RE.find(text)?.as_str();
+
+    let token = COUNT_BEFORE_REVIEW_RE
+        .captures(text)
+        .and_then(|c| c.get(1).map(|m| m.as_str()))
+        .or_else(|| {
+            PAREN_COUNT_RE
+                .captures(text)
+                .and_then(|c| c.get(1).map(|m| m.as_str()))
+        })
+        .or_else(|| ANY_COUNT_RE.find(text).map(|m| m.as_str()))?;
     let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
@@ -701,6 +721,14 @@ mod tests {
     fn parses_reviews_count() {
         assert_eq!(parse_reviews_count("1,234 reviews"), Some(1234));
         assert_eq!(parse_reviews_count("1.234 Rezensionen"), Some(1234));
+        assert_eq!(
+            parse_reviews_count("4.7 stars from 1,234 reviews"),
+            Some(1234)
+        );
+        assert_eq!(
+            parse_reviews_count("4,7 Sterne · 1.234 Rezensionen"),
+            Some(1234)
+        );
         assert_eq!(parse_reviews_count("(1\u{00a0}234)"), Some(1234));
         assert_eq!(parse_reviews_count("7 reviews"), Some(7));
         assert_eq!(parse_reviews_count("(42)"), Some(42));
