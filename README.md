@@ -22,7 +22,9 @@ Until now there has been **no production-quality Rust crate** for scraping Googl
 
 ## Requirements
 
-- Chrome / Chromium installed locally.
+- Chrome / Chromium installed locally — **unless** you connect to a remote Chrome
+  via `browserless_url` / `BROWSERLESS_URL` (see [Remote Chrome](#remote-chrome-browserless--no-local-chrome-required)),
+  in which case no local browser is needed.
   - macOS: detected at `/Applications/Google Chrome.app/...`.
   - Linux: `apt install chromium-browser`.
   - Windows: detected in `Program Files`.

@@ -180,7 +180,7 @@ impl MapsScraper {
             .filter(|u| !u.is_empty());
 
         let (browser, mut handler) = if let Some(ws_url) = remote {
-            info!(endpoint = %ws_url, "connecting to remote Chrome");
+            info!(endpoint = %redact_url(&ws_url), "connecting to remote Chrome");
             if cfg.proxy.is_some() || std::env::var("PROXY_URL").is_ok() {
                 warn!(
                     "proxy config is ignored when connecting to a remote Chrome; \
@@ -208,7 +208,7 @@ impl MapsScraper {
                 .or_else(|| std::env::var("PROXY_URL").ok())
                 .filter(|p| !p.is_empty())
             {
-                info!(%proxy, "using proxy server");
+                info!(server = %redact_url(&proxy), "using proxy server");
                 builder = builder.arg(format!("--proxy-server={proxy}"));
             }
             let browser_cfg = builder
@@ -404,6 +404,21 @@ impl PlaceDetailRaw {
 /// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
 /// complete within `timeout`. Prevents a stalled network/render from blocking
 /// the async task indefinitely.
+/// Strip credentials from a URL so it is safe to log: removes any userinfo
+/// (`user:pass@`) and the query string (which may carry a `?token=...`).
+/// Falls back to `"<redacted>"` when the value does not parse as a URL.
+fn redact_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.to_string()
+        }
+        Err(_) => "<redacted>".to_string(),
+    }
+}
+
 async fn goto_with_timeout(page: &Page, url: &str, timeout: Duration) -> Result<()> {
     tokio::time::timeout(timeout, page.goto(url))
         .await
@@ -576,6 +591,19 @@ mod tests {
         assert_eq!(c.max_places, None);
         assert!(c.proxy.is_none());
         assert!(c.browserless_url.is_none());
+    }
+
+    #[test]
+    fn redact_url_strips_credentials_and_token() {
+        assert_eq!(
+            redact_url("http://user:pass@proxy.example:8080"),
+            "http://proxy.example:8080/"
+        );
+        assert_eq!(
+            redact_url("wss://chrome.browserless.io?token=secret123"),
+            "wss://chrome.browserless.io/"
+        );
+        assert_eq!(redact_url("not a url"), "<redacted>");
     }
 
     #[test]
