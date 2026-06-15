@@ -329,29 +329,30 @@ impl MapsScraper {
                     warn!("place goto: {e}");
                     continue;
                 }
-                // Wait for the detail panel to render (the <h1> is the first
-                // element present) before extracting, so a slow render doesn't
-                // yield an empty Place; then let it settle.
+                // Give the detail panel a chance to render before extracting:
+                // wait (bounded) for the title `<h1>` that `extract_place_details`
+                // reads, then let the rest settle. This reduces — but cannot fully
+                // prevent — empty results on a slow render.
                 let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
                 tokio::time::sleep(self.cfg.place_panel_delay).await;
                 let detail = match extract_place_details(page).await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("extract: {e}");
+                        // Still register the URL so a consistently-failing place
+                        // is not re-navigated on every subsequent query.
+                        seen_keys.lock().await.insert(place_url.clone());
                         continue;
                     }
                 };
 
-                // Dedup key: prefer website domain, else maps_url. Always register
-                // the raw URL too so the fast-path above can skip exact repeats.
+                // Dedup by website domain (falling back to the maps URL when there
+                // is no website), and register the place. See `register_place`.
                 let key = detail.website_domain().unwrap_or_else(|| place_url.clone());
-                let mut sk = seen_keys.lock().await;
-                let is_new = sk.insert(key);
-                sk.insert(place_url.clone());
+                let is_new = register_place(&mut *seen_keys.lock().await, &key, &place_url);
                 if !is_new {
                     continue;
                 }
-                drop(sk);
 
                 let (postcode, city) =
                     parse_german_address(detail.address.as_deref().unwrap_or(""));
@@ -568,6 +569,21 @@ fn parse_german_address(addr: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+/// Record a freshly-extracted place in the `seen` set and report whether it is
+/// new (i.e. should be kept). `domain_key` is the dedup key — the website domain
+/// when the place has one, otherwise the maps URL. `raw_url` is the place's maps
+/// URL, which is *always* registered so the navigation fast-path can skip exact
+/// repeats later, even for a place whose dedup key is its domain.
+///
+/// Note: `seen` mixes two key namespaces — bare website domains (`example.de`)
+/// and full `https://…` URLs. They can never collide because a domain has no
+/// URL scheme.
+fn register_place(seen: &mut HashSet<String>, domain_key: &str, raw_url: &str) -> bool {
+    let is_new = seen.insert(domain_key.to_string());
+    seen.insert(raw_url.to_string());
+    is_new
+}
+
 /// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
 /// e.g. `https://www.google.com/maps/place/.../@52.5200,13.4050,17z/...`.
 /// Returns `(None, None)` if the URL has no coordinate segment.
@@ -600,6 +616,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.website_domain().as_deref(), Some("example.de"));
+    }
+
+    #[test]
+    fn register_place_dedup() {
+        let mut seen = HashSet::new();
+        // (a) New domain → kept, both keys registered.
+        assert!(register_place(
+            &mut seen,
+            "example.de",
+            "https://maps.google.com/place/A"
+        ));
+        // (b) Same domain via a *different* URL → discarded.
+        assert!(!register_place(
+            &mut seen,
+            "example.de",
+            "https://maps.google.com/place/B"
+        ));
+        // (c) New website-less place (key == raw URL) → kept.
+        assert!(register_place(
+            &mut seen,
+            "https://maps.google.com/place/C",
+            "https://maps.google.com/place/C"
+        ));
+        // (d) The same website-less place again → discarded.
+        assert!(!register_place(
+            &mut seen,
+            "https://maps.google.com/place/C",
+            "https://maps.google.com/place/C"
+        ));
+        // Every visited raw URL is registered for the fast-path.
+        assert!(seen.contains("https://maps.google.com/place/A"));
+        assert!(seen.contains("https://maps.google.com/place/B"));
     }
 
     #[test]
