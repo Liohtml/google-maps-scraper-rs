@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-15
+
 ### Added
 - `Drop` implementation for `MapsScraper` so the CDP handler task is aborted
   even when `close()` is not called (panic / early return).
