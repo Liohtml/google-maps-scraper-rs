@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format is based on
   remote Chrome over the DevTools WebSocket instead of launching a local browser.
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
 - GitHub Actions CI: build, test, and clippy on push / pull request.
+- CI now runs `cargo audit` to scan dependencies for known security advisories.
 
 ### Changed
 - Page navigations are wrapped in `tokio::time::timeout` and fail with a clear
