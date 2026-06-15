@@ -21,8 +21,12 @@ All notable changes to this project are documented here. The format is based on
 - The hardcoded (and stale, macOS-specific) Chrome user-agent is no longer set
   by default. Chrome now reports its own current UA unless `user_agent` is set,
   avoiding a UA/TLS-fingerprint and UA/host-OS mismatch.
+- Headless runs now use Chrome's **new** headless mode (`--headless=new`)
+  instead of the old `--headless`, so the reported user-agent no longer contains
+  the `HeadlessChrome` bot-detection token.
 - The proxy value (`proxy` / `PROXY_URL`) is now rejected at launch if it
-  contains whitespace, preventing extra Chrome flags being injected via the arg.
+  contains whitespace (a malformed value Chrome would silently ignore, falling
+  back to a direct connection and leaking the real IP).
 - Page navigations are wrapped in `tokio::time::timeout` and fail with a clear
   error instead of hanging indefinitely.
 - Collected feed URLs are filtered to the `https://` scheme before navigation,

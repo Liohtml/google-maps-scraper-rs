@@ -72,6 +72,10 @@ pub enum Error {
     #[error("page error: {0}")]
     Page(String),
 
+    /// A `ScraperConfig` value was rejected (e.g. an invalid proxy).
+    #[error("invalid config: {0}")]
+    Config(String),
+
     /// Underlying chromiumoxide error.
     #[error("cdp: {0}")]
     Cdp(#[from] chromiumoxide::error::CdpError),
@@ -189,7 +193,9 @@ impl MapsScraper {
 
         let (browser, mut handler) = if let Some(ws_url) = remote {
             info!(endpoint = %redact_url(&ws_url), "connecting to remote Chrome");
-            if cfg.proxy.is_some() || std::env::var("PROXY_URL").is_ok() {
+            let proxy_configured = cfg.proxy.as_deref().is_some_and(|p| !p.is_empty())
+                || std::env::var("PROXY_URL").is_ok_and(|p| !p.is_empty());
+            if proxy_configured {
                 warn!(
                     "proxy config is ignored when connecting to a remote Chrome; \
                      configure the proxy on the remote endpoint instead"
@@ -205,16 +211,19 @@ impl MapsScraper {
                 .arg("--no-default-browser-check")
                 .arg("--disable-blink-features=AutomationControlled")
                 .arg("--window-size=1280,1024");
-            // User-Agent: only override when explicitly configured. Leaving it
-            // unset lets Chrome report its real, current UA (consistent with the
-            // actual TLS fingerprint) instead of a hardcoded string that goes
-            // stale and mismatches the host OS.
+            // Only override the UA when explicitly configured (see field docs).
             if let Some(ua) = cfg.user_agent.as_deref().filter(|u| !u.is_empty()) {
                 builder = builder.arg(format!("--user-agent={ua}"));
             }
-            if !cfg.headless {
-                builder = builder.with_head();
-            }
+            // Use Chrome's *new* headless mode when headless: unlike the old
+            // `--headless`, it reports a normal, current user-agent with no
+            // `HeadlessChrome` token — so the default `user_agent: None` does not
+            // leak that bot-detection signal.
+            builder = if cfg.headless {
+                builder.new_headless_mode()
+            } else {
+                builder.with_head()
+            };
             // Proxy: explicit config field wins, otherwise fall back to PROXY_URL.
             if let Some(proxy) = cfg
                 .proxy
@@ -416,17 +425,14 @@ impl PlaceDetailRaw {
     }
 }
 
-/// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
-/// complete within `timeout`. Prevents a stalled network/render from blocking
-/// the async task indefinitely.
-/// Reject a proxy value that is unsafe to pass as a single Chrome argument.
-/// A whitespace character could split `--proxy-server=<value>` into additional,
-/// attacker-controlled flags (e.g. ` --disable-web-security`).
+/// Reject a proxy value that Chrome cannot use as a single `--proxy-server`
+/// argument. A value with whitespace is malformed: Chrome receives the whole
+/// `--proxy-server=<value>` as one token, silently fails to apply the proxy, and
+/// falls back to a **direct** connection — leaking the real IP. Failing loudly
+/// here surfaces the misconfiguration instead.
 fn check_proxy(proxy: &str) -> Result<()> {
     if proxy.contains(char::is_whitespace) {
-        return Err(Error::ChromeLaunch(
-            "proxy must not contain whitespace".into(),
-        ));
+        return Err(Error::Config("proxy must not contain whitespace".into()));
     }
     Ok(())
 }
@@ -446,6 +452,9 @@ fn redact_url(raw: &str) -> String {
     }
 }
 
+/// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
+/// complete within `timeout`. Prevents a stalled network/render from blocking
+/// the async task indefinitely.
 async fn goto_with_timeout(page: &Page, url: &str, timeout: Duration) -> Result<()> {
     tokio::time::timeout(timeout, page.goto(url))
         .await
@@ -625,7 +634,7 @@ mod tests {
     fn check_proxy_rejects_whitespace() {
         assert!(check_proxy("http://user:pass@host:8080").is_ok());
         assert!(check_proxy("socks5://10.0.0.1:1080").is_ok());
-        // Whitespace would let the value inject extra Chrome flags.
+        // Whitespace makes a malformed proxy Chrome would silently ignore.
         assert!(check_proxy("http://h:1 --disable-web-security").is_err());
         assert!(check_proxy("http://h:1\t--foo").is_err());
     }
