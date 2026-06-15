@@ -87,11 +87,14 @@ pub struct Place {
     pub name: String,
     /// Full address as shown in the panel.
     pub address: Option<String>,
-    /// 5-digit postcode — **only populated for German-format addresses**
-    /// (`NNNNN City`). `None` for non-German addresses.
+    /// 5-digit postcode parsed from the address. Populated only when the
+    /// address contains a `NNNNN City` segment (German postal format); `None`
+    /// otherwise. The match is a heuristic and may also fire on other 5-digit
+    /// formats (e.g. a US ZIP + city).
     pub postcode: Option<String>,
-    /// City — **only populated for German-format addresses** (parsed alongside
-    /// the postcode). `None` for non-German addresses.
+    /// City parsed alongside the postcode from a `NNNNN City` segment (German
+    /// postal format). `None` when no such segment is present. Same heuristic
+    /// caveat as [`Place::postcode`].
     pub city: Option<String>,
     /// First phone number listed.
     pub phone: Option<String>,

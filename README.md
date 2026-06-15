@@ -127,8 +127,8 @@ size, user agent) are controlled by the remote endpoint — configure those ther
 pub struct Place {
     pub name: String,
     pub address: Option<String>,
-    pub postcode: Option<String>,        // German-format addresses only (else None)
-    pub city: Option<String>,            // German-format addresses only (else None)
+    pub postcode: Option<String>,        // "NNNNN City" (German postal format); else None
+    pub city: Option<String>,            // parsed alongside postcode; else None
     pub phone: Option<String>,
     pub website: Option<String>,
     pub maps_url: Option<String>,
