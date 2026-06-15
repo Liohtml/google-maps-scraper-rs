@@ -243,10 +243,19 @@ impl MapsScraper {
             .await
             .map_err(|e| Error::Page(e.to_string()))?;
 
+        // Run the scrape on a dedicated tab and always close it afterwards —
+        // even if the body returns early with an error — so a failed run never
+        // leaks an open Chrome tab for the lifetime of the scraper.
+        let result = self.search_many_on_page(&page, queries).await;
+        let _ = page.close().await;
+        result
+    }
+
+    async fn search_many_on_page(&self, page: &Page, queries: &[&str]) -> Result<Vec<Place>> {
         // Visit the maps homepage once to handle the consent banner.
-        goto_with_timeout(&page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
+        goto_with_timeout(page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = dismiss_consent(&page).await;
+        let _ = dismiss_consent(page).await;
 
         let out: Arc<Mutex<Vec<Place>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -254,7 +263,7 @@ impl MapsScraper {
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
             let url = format!("{}/search/{}/", SEARCH_URL_BASE, urlencoding::encode(q));
-            if let Err(e) = goto_with_timeout(&page, &url, self.cfg.nav_timeout).await {
+            if let Err(e) = goto_with_timeout(page, &url, self.cfg.nav_timeout).await {
                 warn!("goto error: {e}");
                 continue;
             }
@@ -266,11 +275,11 @@ impl MapsScraper {
                     .await;
 
             // Scroll until stable
-            let _ = scroll_feed(&page, self.cfg.max_scroll_iterations).await;
+            let _ = scroll_feed(page, self.cfg.max_scroll_iterations).await;
 
             // Collect place URLs in the feed. Only keep https:// links so a
             // tampered DOM can't feed us a `javascript:` / `data:` URL to navigate to.
-            let urls: Vec<String> = collect_place_urls(&page)
+            let urls: Vec<String> = collect_place_urls(page)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -308,12 +317,24 @@ impl MapsScraper {
                 if self.cfg.max_places.is_some_and(|m| added_this_query >= m) {
                     break;
                 }
-                if let Err(e) = goto_with_timeout(&page, &place_url, self.cfg.nav_timeout).await {
+                // Fast-path: skip a place URL we have already visited (within this
+                // query or a previous one) before paying for a full navigation.
+                {
+                    let sk = seen_keys.lock().await;
+                    if sk.contains(&place_url) {
+                        continue;
+                    }
+                }
+                if let Err(e) = goto_with_timeout(page, &place_url, self.cfg.nav_timeout).await {
                     warn!("place goto: {e}");
                     continue;
                 }
+                // Wait for the detail panel to render (the <h1> is the first
+                // element present) before extracting, so a slow render doesn't
+                // yield an empty Place; then let it settle.
+                let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
                 tokio::time::sleep(self.cfg.place_panel_delay).await;
-                let detail = match extract_place_details(&page).await {
+                let detail = match extract_place_details(page).await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("extract: {e}");
@@ -321,10 +342,13 @@ impl MapsScraper {
                     }
                 };
 
-                // Dedup key: prefer website domain, else maps_url.
+                // Dedup key: prefer website domain, else maps_url. Always register
+                // the raw URL too so the fast-path above can skip exact repeats.
                 let key = detail.website_domain().unwrap_or_else(|| place_url.clone());
                 let mut sk = seen_keys.lock().await;
-                if !sk.insert(key) {
+                let is_new = sk.insert(key);
+                sk.insert(place_url.clone());
+                if !is_new {
                     continue;
                 }
                 drop(sk);
@@ -348,10 +372,6 @@ impl MapsScraper {
                 added_this_query += 1;
             }
         }
-
-        // Best-effort: close the working tab so it doesn't leak for the
-        // lifetime of the browser when the scraper is reused.
-        let _ = page.close().await;
 
         let final_out = Arc::try_unwrap(out)
             .map_err(|_| Error::Page("output Arc still held".into()))?
