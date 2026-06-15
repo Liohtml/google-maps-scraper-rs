@@ -64,9 +64,10 @@ jobs:
       - uses: Swatinem/rust-cache@400e7407cfd7a091e5fbb6afec01ec146c432b7c # v2.7.7
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # Cargo.lock is gitignored (library crate), so generate one to audit
-      # the exact resolved dependency versions.
-      - name: Generate lockfile
-        run: cargo generate-lockfile
+      # Audit the committed Cargo.lock if there is one; otherwise generate a
+      # lockfile first so `cargo audit` has something to scan. Stays correct
+      # whether or not the lockfile is committed.
+      - name: Ensure lockfile
+        run: test -f Cargo.lock || cargo generate-lockfile
       - name: Audit dependencies
         run: cargo audit
