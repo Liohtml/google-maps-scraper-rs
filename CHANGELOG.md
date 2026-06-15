@@ -14,9 +14,15 @@ All notable changes to this project are documented here. The format is based on
 - `ScraperConfig::browserless_url` (and `BROWSERLESS_URL` env fallback) — connect to a
   remote Chrome over the DevTools WebSocket instead of launching a local browser.
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
+- `ScraperConfig::user_agent` — optional `User-Agent` override.
 - GitHub Actions CI: build, test, and clippy on push / pull request.
 
 ### Changed
+- The hardcoded (and stale, macOS-specific) Chrome user-agent is no longer set
+  by default. Chrome now reports its own current UA unless `user_agent` is set,
+  avoiding a UA/TLS-fingerprint and UA/host-OS mismatch.
+- The proxy value (`proxy` / `PROXY_URL`) is now rejected at launch if it
+  contains whitespace, preventing extra Chrome flags being injected via the arg.
 - Page navigations are wrapped in `tokio::time::timeout` and fail with a clear
   error instead of hanging indefinitely.
 - Collected feed URLs are filtered to the `https://` scheme before navigation,

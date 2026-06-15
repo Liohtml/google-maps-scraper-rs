@@ -127,7 +127,14 @@ pub struct ScraperConfig {
     pub nav_timeout: Duration,
     /// Optional proxy passed to Chrome as `--proxy-server=<value>`.
     /// If `None`, falls back to the `PROXY_URL` environment variable.
+    /// The value must not contain whitespace (rejected at launch).
     pub proxy: Option<String>,
+    /// Optional `User-Agent` override.
+    ///
+    /// `None` (default) leaves Chrome to report its own, always-current UA,
+    /// which stays consistent with the real TLS/HTTP2 fingerprint. Set this
+    /// only if you need to pin a specific UA string.
+    pub user_agent: Option<String>,
     /// Optional WebSocket URL of a remote Chrome (e.g. a Browserless instance)
     /// to connect to instead of launching a local browser. If `None`, falls
     /// back to the `BROWSERLESS_URL` environment variable.
@@ -149,6 +156,7 @@ impl Default for ScraperConfig {
             max_places: None,
             nav_timeout: Duration::from_secs(30),
             proxy: None,
+            user_agent: None,
             browserless_url: None,
         }
     }
@@ -196,8 +204,14 @@ impl MapsScraper {
                 .arg("--no-first-run")
                 .arg("--no-default-browser-check")
                 .arg("--disable-blink-features=AutomationControlled")
-                .arg("--window-size=1280,1024")
-                .arg("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+                .arg("--window-size=1280,1024");
+            // User-Agent: only override when explicitly configured. Leaving it
+            // unset lets Chrome report its real, current UA (consistent with the
+            // actual TLS fingerprint) instead of a hardcoded string that goes
+            // stale and mismatches the host OS.
+            if let Some(ua) = cfg.user_agent.as_deref().filter(|u| !u.is_empty()) {
+                builder = builder.arg(format!("--user-agent={ua}"));
+            }
             if !cfg.headless {
                 builder = builder.with_head();
             }
@@ -208,6 +222,7 @@ impl MapsScraper {
                 .or_else(|| std::env::var("PROXY_URL").ok())
                 .filter(|p| !p.is_empty())
             {
+                check_proxy(&proxy)?;
                 info!(server = %redact_url(&proxy), "using proxy server");
                 builder = builder.arg(format!("--proxy-server={proxy}"));
             }
@@ -404,6 +419,18 @@ impl PlaceDetailRaw {
 /// Navigate `page` to `url`, failing with [`Error::Page`] if it does not
 /// complete within `timeout`. Prevents a stalled network/render from blocking
 /// the async task indefinitely.
+/// Reject a proxy value that is unsafe to pass as a single Chrome argument.
+/// A whitespace character could split `--proxy-server=<value>` into additional,
+/// attacker-controlled flags (e.g. ` --disable-web-security`).
+fn check_proxy(proxy: &str) -> Result<()> {
+    if proxy.contains(char::is_whitespace) {
+        return Err(Error::ChromeLaunch(
+            "proxy must not contain whitespace".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Strip credentials from a URL so it is safe to log: removes any userinfo
 /// (`user:pass@`) and the query string (which may carry a `?token=...`).
 /// Falls back to `"<redacted>"` when the value does not parse as a URL.
@@ -590,7 +617,17 @@ mod tests {
         assert_eq!(c.max_scroll_iterations, 30);
         assert_eq!(c.max_places, None);
         assert!(c.proxy.is_none());
+        assert!(c.user_agent.is_none());
         assert!(c.browserless_url.is_none());
+    }
+
+    #[test]
+    fn check_proxy_rejects_whitespace() {
+        assert!(check_proxy("http://user:pass@host:8080").is_ok());
+        assert!(check_proxy("socks5://10.0.0.1:1080").is_ok());
+        // Whitespace would let the value inject extra Chrome flags.
+        assert!(check_proxy("http://h:1 --disable-web-security").is_err());
+        assert!(check_proxy("http://h:1\t--foo").is_err());
     }
 
     #[test]
