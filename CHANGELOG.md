@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- `ScraperConfig::place_panel_jitter` — random extra delay (default `0..=750 ms`)
+  added before each place visit so the enrich path no longer makes navigations
+  at a fixed, easily-detected interval.
+
 ## [0.2.0] - 2026-06-15
 
 ### Added

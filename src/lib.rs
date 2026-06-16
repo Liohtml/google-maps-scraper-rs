@@ -127,8 +127,17 @@ pub struct ScraperConfig {
     pub enrich: bool,
     /// Delay between consecutive HTTP requests inside Chrome.
     pub between_query_delay: Duration,
-    /// Per-place delay after clicking (gives the panel time to render).
+    /// Per-place delay after clicking (gives the panel time to render). The
+    /// effective wait is this plus a random `0..=place_panel_jitter` — see
+    /// [`ScraperConfig::place_panel_jitter`].
     pub place_panel_delay: Duration,
+    /// Upper bound on the random extra delay added *on top of*
+    /// [`ScraperConfig::place_panel_delay`] before each place visit. A fresh
+    /// value in `0..=place_panel_jitter` is drawn per place to de-regularise the
+    /// request cadence (mild bot-detection mitigation, not a guarantee). The
+    /// jitter is purely additive, so `place_panel_delay` is always the minimum;
+    /// set this to `Duration::ZERO` to disable it. Default: 750 ms.
+    pub place_panel_jitter: Duration,
     /// Maximum number of unique places to return per query.
     /// `None` (default) means unlimited.
     pub max_places: Option<usize>,
@@ -162,6 +171,7 @@ impl Default for ScraperConfig {
             enrich: true,
             between_query_delay: Duration::from_secs(2),
             place_panel_delay: Duration::from_millis(1500),
+            place_panel_jitter: Duration::from_millis(750),
             max_places: None,
             nav_timeout: Duration::from_secs(30),
             proxy: None,
@@ -363,7 +373,12 @@ impl MapsScraper {
                 // reads, then let the rest settle. This reduces — but cannot fully
                 // prevent — empty results on a slow render.
                 let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
-                tokio::time::sleep(self.cfg.place_panel_delay).await;
+                // Settle delay + random jitter so consecutive place visits don't
+                // form a fixed-interval (easily-flagged) pattern.
+                let max_jitter_ms =
+                    u64::try_from(self.cfg.place_panel_jitter.as_millis()).unwrap_or(u64::MAX);
+                let jitter = Duration::from_millis(jitter_ms(time_seed(), max_jitter_ms));
+                tokio::time::sleep(self.cfg.place_panel_delay + jitter).await;
                 let detail = match extract_place_details(page).await {
                     Ok(d) => d,
                     Err(e) => {
@@ -625,6 +640,31 @@ fn register_place(seen: &mut HashSet<String>, domain_key: &str, raw_url: &str) -
     is_new
 }
 
+/// Map a seed to a value in `0..=max_ms` (inclusive). Non-cryptographic — used
+/// only to spread out the delay between place visits, so a weak seed is fine.
+fn jitter_ms(seed: u64, max_ms: u64) -> u64 {
+    if max_ms == 0 { 0 } else { seed % (max_ms + 1) }
+}
+
+/// A cheap, std-only seed for [`jitter_ms`]. Mixes the wall-clock nanoseconds
+/// with a process-wide call counter through `DefaultHasher` (SipHash), so the
+/// result is well-distributed across the `u64` range and — thanks to the
+/// counter — never repeats nor correlates between successive calls, even if the
+/// clock is coarse. Not cryptographic; only used to de-regularise delays.
+fn time_seed() -> u64 {
+    use std::hash::Hasher;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u64(nanos);
+    hasher.write_u64(count);
+    hasher.finish()
+}
+
 /// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
 /// e.g. `https://www.google.com/maps/place/.../@52.5200,13.4050,17z/...`.
 /// Returns `(None, None)` if the URL has no coordinate segment.
@@ -701,6 +741,19 @@ mod tests {
         assert!(c.proxy.is_none());
         assert!(c.user_agent.is_none());
         assert!(c.browserless_url.is_none());
+        assert_eq!(c.place_panel_jitter, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn jitter_within_bounds() {
+        // Zero jitter is disabled regardless of seed.
+        assert_eq!(jitter_ms(123_456, 0), 0);
+        // Any seed maps into 0..=max inclusive.
+        for seed in [0u64, 1, 750, 751, u64::MAX] {
+            assert!(jitter_ms(seed, 750) <= 750);
+        }
+        assert_eq!(jitter_ms(750, 750), 750);
+        assert_eq!(jitter_ms(751, 750), 0);
     }
 
     #[test]
