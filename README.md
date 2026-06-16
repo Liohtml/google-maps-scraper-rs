@@ -86,6 +86,7 @@ let cfg = ScraperConfig {
     enrich: true,                          // click each place for website/phone
     between_query_delay: Duration::from_secs(3),
     place_panel_delay: Duration::from_millis(2000),
+    place_panel_jitter: Duration::from_millis(750), // random extra 0..=750ms per place
     max_places: Some(50),                  // cap unique places per query (None = unlimited)
     nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
     proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var

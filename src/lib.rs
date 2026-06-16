@@ -129,6 +129,12 @@ pub struct ScraperConfig {
     pub between_query_delay: Duration,
     /// Per-place delay after clicking (gives the panel time to render).
     pub place_panel_delay: Duration,
+    /// Upper bound on the random extra delay added before each place visit, on
+    /// top of [`ScraperConfig::place_panel_delay`]. A value in `0..=jitter` is
+    /// drawn per place to de-regularise the request pattern (lower bot-detection
+    /// risk). `Duration::ZERO` (the effective minimum) disables jitter.
+    /// Default: 750 ms.
+    pub place_panel_jitter: Duration,
     /// Maximum number of unique places to return per query.
     /// `None` (default) means unlimited.
     pub max_places: Option<usize>,
@@ -162,6 +168,7 @@ impl Default for ScraperConfig {
             enrich: true,
             between_query_delay: Duration::from_secs(2),
             place_panel_delay: Duration::from_millis(1500),
+            place_panel_jitter: Duration::from_millis(750),
             max_places: None,
             nav_timeout: Duration::from_secs(30),
             proxy: None,
@@ -363,7 +370,13 @@ impl MapsScraper {
                 // reads, then let the rest settle. This reduces — but cannot fully
                 // prevent — empty results on a slow render.
                 let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
-                tokio::time::sleep(self.cfg.place_panel_delay).await;
+                // Settle delay + random jitter so consecutive place visits don't
+                // form a fixed-interval (easily-flagged) pattern.
+                let jitter = Duration::from_millis(jitter_ms(
+                    time_seed(),
+                    self.cfg.place_panel_jitter.as_millis() as u64,
+                ));
+                tokio::time::sleep(self.cfg.place_panel_delay + jitter).await;
                 let detail = match extract_place_details(page).await {
                     Ok(d) => d,
                     Err(e) => {
@@ -625,6 +638,22 @@ fn register_place(seen: &mut HashSet<String>, domain_key: &str, raw_url: &str) -
     is_new
 }
 
+/// Map a seed to a value in `0..=max_ms` (inclusive). Non-cryptographic — used
+/// only to spread out the delay between place visits, so a weak seed is fine.
+fn jitter_ms(seed: u64, max_ms: u64) -> u64 {
+    if max_ms == 0 { 0 } else { seed % (max_ms + 1) }
+}
+
+/// A cheap, std-only entropy source for [`jitter_ms`]: the sub-second nanos of
+/// the wall clock. Not random across a process restart, but varies enough
+/// between rapid successive calls to break a fixed-interval request cadence.
+fn time_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
 /// e.g. `https://www.google.com/maps/place/.../@52.5200,13.4050,17z/...`.
 /// Returns `(None, None)` if the URL has no coordinate segment.
@@ -701,6 +730,19 @@ mod tests {
         assert!(c.proxy.is_none());
         assert!(c.user_agent.is_none());
         assert!(c.browserless_url.is_none());
+        assert_eq!(c.place_panel_jitter, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn jitter_within_bounds() {
+        // Zero jitter is disabled regardless of seed.
+        assert_eq!(jitter_ms(123_456, 0), 0);
+        // Any seed maps into 0..=max inclusive.
+        for seed in [0u64, 1, 750, 751, u64::MAX] {
+            assert!(jitter_ms(seed, 750) <= 750);
+        }
+        assert_eq!(jitter_ms(750, 750), 750);
+        assert_eq!(jitter_ms(751, 750), 0);
     }
 
     #[test]
