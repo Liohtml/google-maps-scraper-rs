@@ -89,6 +89,7 @@ let cfg = ScraperConfig {
     max_places: Some(50),                  // cap unique places per query (None = unlimited)
     nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
     proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var
+    user_agent: None,                      // None = Chrome's own current UA (recommended)
     browserless_url: None,                 // or set BROWSERLESS_URL to use a remote Chrome
 };
 let scraper = MapsScraper::launch(cfg).await?;
