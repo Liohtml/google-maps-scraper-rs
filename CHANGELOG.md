@@ -16,6 +16,7 @@ All notable changes to this project are documented here. The format is based on
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
 - `ScraperConfig::user_agent` — optional `User-Agent` override.
 - GitHub Actions CI: build, test, and clippy on push / pull request.
+- CI now runs `cargo audit` to scan dependencies for known security advisories.
 
 ### Changed
 - The hardcoded (and stale, macOS-specific) Chrome user-agent is no longer set
