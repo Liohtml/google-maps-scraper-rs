@@ -1,6 +1,6 @@
 [package]
 name = "google-maps-scraper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Lionel Machire <lionel.machire@googlemail.com>"]
 description = "Apify-style Google Maps scraper for Rust — drive a real Chrome via CDP, search by query + scroll the results feed, click each place, extract name/address/phone/website. No API key needed."

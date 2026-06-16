@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-15
+
 ### Added
 - `Drop` implementation for `MapsScraper` so the CDP handler task is aborted
   even when `close()` is not called (panic / early return).
@@ -62,3 +64,8 @@ All notable changes to this project are documented here. The format is based on
 - `Place` — structured output with name, address, postcode, city, phone, website, maps_url.
 - German postcode/city parsing via `parse_german_address`.
 - Cookie consent auto-dismiss for German and English Google interfaces.
+
+<!-- Version links resolve once the matching git tags are pushed. -->
+[Unreleased]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Liohtml/google-maps-scraper-rs/releases/tag/v0.1.0
