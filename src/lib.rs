@@ -127,13 +127,16 @@ pub struct ScraperConfig {
     pub enrich: bool,
     /// Delay between consecutive HTTP requests inside Chrome.
     pub between_query_delay: Duration,
-    /// Per-place delay after clicking (gives the panel time to render).
+    /// Per-place delay after clicking (gives the panel time to render). The
+    /// effective wait is this plus a random `0..=place_panel_jitter` — see
+    /// [`ScraperConfig::place_panel_jitter`].
     pub place_panel_delay: Duration,
-    /// Upper bound on the random extra delay added before each place visit, on
-    /// top of [`ScraperConfig::place_panel_delay`]. A value in `0..=jitter` is
-    /// drawn per place to de-regularise the request pattern (lower bot-detection
-    /// risk). `Duration::ZERO` (the effective minimum) disables jitter.
-    /// Default: 750 ms.
+    /// Upper bound on the random extra delay added *on top of*
+    /// [`ScraperConfig::place_panel_delay`] before each place visit. A fresh
+    /// value in `0..=place_panel_jitter` is drawn per place to de-regularise the
+    /// request cadence (mild bot-detection mitigation, not a guarantee). The
+    /// jitter is purely additive, so `place_panel_delay` is always the minimum;
+    /// set this to `Duration::ZERO` to disable it. Default: 750 ms.
     pub place_panel_jitter: Duration,
     /// Maximum number of unique places to return per query.
     /// `None` (default) means unlimited.
@@ -372,10 +375,9 @@ impl MapsScraper {
                 let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
                 // Settle delay + random jitter so consecutive place visits don't
                 // form a fixed-interval (easily-flagged) pattern.
-                let jitter = Duration::from_millis(jitter_ms(
-                    time_seed(),
-                    self.cfg.place_panel_jitter.as_millis() as u64,
-                ));
+                let max_jitter_ms =
+                    u64::try_from(self.cfg.place_panel_jitter.as_millis()).unwrap_or(u64::MAX);
+                let jitter = Duration::from_millis(jitter_ms(time_seed(), max_jitter_ms));
                 tokio::time::sleep(self.cfg.place_panel_delay + jitter).await;
                 let detail = match extract_place_details(page).await {
                     Ok(d) => d,
@@ -644,14 +646,23 @@ fn jitter_ms(seed: u64, max_ms: u64) -> u64 {
     if max_ms == 0 { 0 } else { seed % (max_ms + 1) }
 }
 
-/// A cheap, std-only entropy source for [`jitter_ms`]: the sub-second nanos of
-/// the wall clock. Not random across a process restart, but varies enough
-/// between rapid successive calls to break a fixed-interval request cadence.
+/// A cheap, std-only seed for [`jitter_ms`]. Mixes the wall-clock nanoseconds
+/// with a process-wide call counter through `DefaultHasher` (SipHash), so the
+/// result is well-distributed across the `u64` range and — thanks to the
+/// counter — never repeats nor correlates between successive calls, even if the
+/// clock is coarse. Not cryptographic; only used to de-regularise delays.
 fn time_seed() -> u64 {
-    std::time::SystemTime::now()
+    use std::hash::Hasher;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u64(nanos);
+    hasher.write_u64(count);
+    hasher.finish()
 }
 
 /// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
