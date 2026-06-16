@@ -243,10 +243,19 @@ impl MapsScraper {
             .await
             .map_err(|e| Error::Page(e.to_string()))?;
 
+        // Run the scrape on a dedicated tab and always close it afterwards —
+        // even if the body returns early with an error — so a failed run never
+        // leaks an open Chrome tab for the lifetime of the scraper.
+        let result = self.search_many_on_page(&page, queries).await;
+        let _ = page.close().await;
+        result
+    }
+
+    async fn search_many_on_page(&self, page: &Page, queries: &[&str]) -> Result<Vec<Place>> {
         // Visit the maps homepage once to handle the consent banner.
-        goto_with_timeout(&page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
+        goto_with_timeout(page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = dismiss_consent(&page).await;
+        let _ = dismiss_consent(page).await;
 
         let out: Arc<Mutex<Vec<Place>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -254,7 +263,7 @@ impl MapsScraper {
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
             let url = format!("{}/search/{}/", SEARCH_URL_BASE, urlencoding::encode(q));
-            if let Err(e) = goto_with_timeout(&page, &url, self.cfg.nav_timeout).await {
+            if let Err(e) = goto_with_timeout(page, &url, self.cfg.nav_timeout).await {
                 warn!("goto error: {e}");
                 continue;
             }
@@ -266,11 +275,11 @@ impl MapsScraper {
                     .await;
 
             // Scroll until stable
-            let _ = scroll_feed(&page, self.cfg.max_scroll_iterations).await;
+            let _ = scroll_feed(page, self.cfg.max_scroll_iterations).await;
 
             // Collect place URLs in the feed. Only keep https:// links so a
             // tampered DOM can't feed us a `javascript:` / `data:` URL to navigate to.
-            let urls: Vec<String> = collect_place_urls(&page)
+            let urls: Vec<String> = collect_place_urls(page)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -308,26 +317,42 @@ impl MapsScraper {
                 if self.cfg.max_places.is_some_and(|m| added_this_query >= m) {
                     break;
                 }
-                if let Err(e) = goto_with_timeout(&page, &place_url, self.cfg.nav_timeout).await {
+                // Fast-path: skip a place URL we have already visited (within this
+                // query or a previous one) before paying for a full navigation.
+                {
+                    let sk = seen_keys.lock().await;
+                    if sk.contains(&place_url) {
+                        continue;
+                    }
+                }
+                if let Err(e) = goto_with_timeout(page, &place_url, self.cfg.nav_timeout).await {
                     warn!("place goto: {e}");
                     continue;
                 }
+                // Give the detail panel a chance to render before extracting:
+                // wait (bounded) for the title `<h1>` that `extract_place_details`
+                // reads, then let the rest settle. This reduces — but cannot fully
+                // prevent — empty results on a slow render.
+                let _ = tokio::time::timeout(self.cfg.nav_timeout, page.find_element("h1")).await;
                 tokio::time::sleep(self.cfg.place_panel_delay).await;
-                let detail = match extract_place_details(&page).await {
+                let detail = match extract_place_details(page).await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("extract: {e}");
+                        // Still register the URL so a consistently-failing place
+                        // is not re-navigated on every subsequent query.
+                        seen_keys.lock().await.insert(place_url.clone());
                         continue;
                     }
                 };
 
-                // Dedup key: prefer website domain, else maps_url.
+                // Dedup by website domain (falling back to the maps URL when there
+                // is no website), and register the place. See `register_place`.
                 let key = detail.website_domain().unwrap_or_else(|| place_url.clone());
-                let mut sk = seen_keys.lock().await;
-                if !sk.insert(key) {
+                let is_new = register_place(&mut *seen_keys.lock().await, &key, &place_url);
+                if !is_new {
                     continue;
                 }
-                drop(sk);
 
                 let (postcode, city) =
                     parse_german_address(detail.address.as_deref().unwrap_or(""));
@@ -348,10 +373,6 @@ impl MapsScraper {
                 added_this_query += 1;
             }
         }
-
-        // Best-effort: close the working tab so it doesn't leak for the
-        // lifetime of the browser when the scraper is reused.
-        let _ = page.close().await;
 
         let final_out = Arc::try_unwrap(out)
             .map_err(|_| Error::Page("output Arc still held".into()))?
@@ -548,6 +569,21 @@ fn parse_german_address(addr: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+/// Record a freshly-extracted place in the `seen` set and report whether it is
+/// new (i.e. should be kept). `domain_key` is the dedup key — the website domain
+/// when the place has one, otherwise the maps URL. `raw_url` is the place's maps
+/// URL, which is *always* registered so the navigation fast-path can skip exact
+/// repeats later, even for a place whose dedup key is its domain.
+///
+/// Note: `seen` mixes two key namespaces — bare website domains (`example.de`)
+/// and full `https://…` URLs. They can never collide because a domain has no
+/// URL scheme.
+fn register_place(seen: &mut HashSet<String>, domain_key: &str, raw_url: &str) -> bool {
+    let is_new = seen.insert(domain_key.to_string());
+    seen.insert(raw_url.to_string());
+    is_new
+}
+
 /// Parse the `@<lat>,<lng>` segment that Google Maps embeds in place URLs,
 /// e.g. `https://www.google.com/maps/place/.../@52.5200,13.4050,17z/...`.
 /// Returns `(None, None)` if the URL has no coordinate segment.
@@ -580,6 +616,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.website_domain().as_deref(), Some("example.de"));
+    }
+
+    #[test]
+    fn register_place_dedup() {
+        let mut seen = HashSet::new();
+        // (a) New domain → kept, both keys registered.
+        assert!(register_place(
+            &mut seen,
+            "example.de",
+            "https://maps.google.com/place/A"
+        ));
+        // (b) Same domain via a *different* URL → discarded.
+        assert!(!register_place(
+            &mut seen,
+            "example.de",
+            "https://maps.google.com/place/B"
+        ));
+        // (c) New website-less place (key == raw URL) → kept.
+        assert!(register_place(
+            &mut seen,
+            "https://maps.google.com/place/C",
+            "https://maps.google.com/place/C"
+        ));
+        // (d) The same website-less place again → discarded.
+        assert!(!register_place(
+            &mut seen,
+            "https://maps.google.com/place/C",
+            "https://maps.google.com/place/C"
+        ));
+        // Every visited raw URL is registered for the fast-path.
+        assert!(seen.contains("https://maps.google.com/place/A"));
+        assert!(seen.contains("https://maps.google.com/place/B"));
     }
 
     #[test]

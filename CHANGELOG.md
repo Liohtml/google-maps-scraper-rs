@@ -27,6 +27,17 @@ All notable changes to this project are documented here. The format is based on
 ### Fixed
 - The working tab opened in `search_many` is now closed before returning,
   fixing a tab/memory leak when a scraper is reused for many searches.
+- The working tab is now closed even when the run returns early with an error
+  (e.g. the initial Maps navigation fails), not only on the success path.
+- Each place detail now waits (bounded) for the panel `<h1>` to render before
+  extraction, in addition to the fixed settle delay — reduces empty `Place`s on
+  slow renders.
+- The enrich path now skips a place URL it has already visited *before*
+  navigating, and registers every visited URL (including ones whose extraction
+  failed), avoiding wasted navigations for exact-duplicate URLs within and
+  across queries. (Distinct URLs sharing one website domain are still
+  deduplicated, but only after navigation, since the domain is read from the
+  loaded panel.)
 
 ## [0.1.0] - 2026-05-02
 
