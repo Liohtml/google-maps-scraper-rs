@@ -13,6 +13,13 @@ All notable changes to this project are documented here. The format is based on
 ### Changed
 - `Cargo.toml` now sets `publish = false` to prevent an accidental `cargo publish`
   to crates.io before the crate is intentionally released.
+- `search_many_on_page` now uses plain `Vec` / `HashSet` instead of
+  `Arc<Mutex<…>>`; the function is single-task, so the async locks and the
+  never-taken `Arc::try_unwrap` panic path were pure overhead.
+- `MapsScraper::search` documents that each call opens/closes a tab and
+  `search_many` should be preferred for multiple queries.
+- `ScraperConfig::max_places` documents that `None` is truly unbounded (one
+  navigation per place, no time bound).
 
 ## [0.2.0] - 2026-06-15
 
