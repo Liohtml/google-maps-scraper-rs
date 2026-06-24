@@ -50,13 +50,12 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 const SEARCH_URL_BASE: &str = "https://www.google.com/maps";
@@ -139,7 +138,13 @@ pub struct ScraperConfig {
     /// set this to `Duration::ZERO` to disable it. Default: 750 ms.
     pub place_panel_jitter: Duration,
     /// Maximum number of unique places to return per query.
-    /// `None` (default) means unlimited.
+    ///
+    /// `None` (default) means **unlimited** — a dense query (e.g. a feed of
+    /// several hundred results) will then perform one Chrome navigation per
+    /// place with no upper bound, so a single call can run for many minutes.
+    /// Set this when you need to bound run time. Note the cap counts *added*
+    /// (deduplicated) places, so a few extra navigations may still occur for
+    /// duplicates before the cap is reached.
     pub max_places: Option<usize>,
     /// Timeout for each page navigation / JS evaluation step. Default: 30s.
     pub nav_timeout: Duration,
@@ -269,6 +274,12 @@ impl MapsScraper {
     }
 
     /// Run a single Google Maps text search and return the extracted places.
+    ///
+    /// # Performance
+    /// Each call opens a fresh Chrome tab, visits the Maps homepage (consent
+    /// dismissal), runs the one query, and closes the tab. Calling this in a
+    /// loop pays that per-call setup N times. For multiple queries prefer
+    /// [`MapsScraper::search_many`], which reuses one tab for all of them.
     pub async fn search(&self, query: &str) -> Result<Vec<Place>> {
         self.search_many(&[query]).await
     }
@@ -296,8 +307,11 @@ impl MapsScraper {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = dismiss_consent(page).await;
 
-        let out: Arc<Mutex<Vec<Place>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Plain owned collections: `search_many_on_page` runs sequentially on a
+        // single task (no `tokio::spawn` shares these), so an `Arc<Mutex<…>>`
+        // would add async-lock overhead and a never-taken panic path for nothing.
+        let mut out: Vec<Place> = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
 
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
@@ -330,15 +344,13 @@ impl MapsScraper {
             let mut added_this_query = 0usize;
 
             if !self.cfg.enrich {
-                let mut o = out.lock().await;
-                let mut sk = seen_keys.lock().await;
                 for u in urls {
                     if self.cfg.max_places.is_some_and(|m| added_this_query >= m) {
                         break;
                     }
-                    if sk.insert(u.clone()) {
+                    if seen_keys.insert(u.clone()) {
                         let (latitude, longitude) = parse_coords_from_maps_url(&u);
-                        o.push(Place {
+                        out.push(Place {
                             name: String::new(),
                             maps_url: Some(u),
                             latitude,
@@ -358,11 +370,8 @@ impl MapsScraper {
                 }
                 // Fast-path: skip a place URL we have already visited (within this
                 // query or a previous one) before paying for a full navigation.
-                {
-                    let sk = seen_keys.lock().await;
-                    if sk.contains(&place_url) {
-                        continue;
-                    }
+                if seen_keys.contains(&place_url) {
+                    continue;
                 }
                 if let Err(e) = goto_with_timeout(page, &place_url, self.cfg.nav_timeout).await {
                     warn!("place goto: {e}");
@@ -385,7 +394,7 @@ impl MapsScraper {
                         warn!("extract: {e}");
                         // Still register the URL so a consistently-failing place
                         // is not re-navigated on every subsequent query.
-                        seen_keys.lock().await.insert(place_url.clone());
+                        seen_keys.insert(place_url.clone());
                         continue;
                     }
                 };
@@ -393,7 +402,7 @@ impl MapsScraper {
                 // Dedup by website domain (falling back to the maps URL when there
                 // is no website), and register the place. See `register_place`.
                 let key = detail.website_domain().unwrap_or_else(|| place_url.clone());
-                let is_new = register_place(&mut *seen_keys.lock().await, &key, &place_url);
+                let is_new = register_place(&mut seen_keys, &key, &place_url);
                 if !is_new {
                     continue;
                 }
@@ -401,8 +410,7 @@ impl MapsScraper {
                 let (postcode, city) =
                     parse_german_address(detail.address.as_deref().unwrap_or(""));
                 let (latitude, longitude) = parse_coords_from_maps_url(&place_url);
-                let mut o = out.lock().await;
-                o.push(Place {
+                out.push(Place {
                     name: detail.name.unwrap_or_default(),
                     address: detail.address,
                     postcode,
@@ -418,10 +426,7 @@ impl MapsScraper {
             }
         }
 
-        let final_out = Arc::try_unwrap(out)
-            .map_err(|_| Error::Page("output Arc still held".into()))?
-            .into_inner();
-        Ok(final_out)
+        Ok(out)
     }
 
     /// Close Chrome cleanly. (Drop also works.)
