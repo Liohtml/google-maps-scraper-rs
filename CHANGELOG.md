@@ -10,6 +10,10 @@ All notable changes to this project are documented here. The format is based on
   added before each place visit so the enrich path no longer makes navigations
   at a fixed, easily-detected interval.
 
+### Changed
+- `Cargo.toml` now sets `publish = false` to prevent an accidental `cargo publish`
+  to crates.io before the crate is intentionally released.
+
 ## [0.2.0] - 2026-06-15
 
 ### Added
