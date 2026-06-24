@@ -143,8 +143,9 @@ pub struct ScraperConfig {
     /// several hundred results) will then perform one Chrome navigation per
     /// place with no upper bound, so a single call can run for many minutes.
     /// Set this when you need to bound run time. Note the cap counts *added*
-    /// (deduplicated) places, so a few extra navigations may still occur for
-    /// duplicates before the cap is reached.
+    /// (deduplicated) places, so in **enrich** mode a few extra navigations may
+    /// still occur for duplicates before the cap is reached (in non-enrich mode
+    /// dedup is pre-navigation, so no navigations are wasted).
     pub max_places: Option<usize>,
     /// Timeout for each page navigation / JS evaluation step. Default: 30s.
     pub nav_timeout: Duration,
@@ -277,9 +278,10 @@ impl MapsScraper {
     ///
     /// # Performance
     /// Each call opens a fresh Chrome tab, visits the Maps homepage (consent
-    /// dismissal), runs the one query, and closes the tab. Calling this in a
-    /// loop pays that per-call setup N times. For multiple queries prefer
-    /// [`MapsScraper::search_many`], which reuses one tab for all of them.
+    /// dismissal, including a fixed ~3 s settle delay), runs the one query, and
+    /// closes the tab. Calling this in a loop pays that per-call setup N times.
+    /// For multiple queries prefer [`MapsScraper::search_many`], which reuses
+    /// one tab for all of them.
     pub async fn search(&self, query: &str) -> Result<Vec<Place>> {
         self.search_many(&[query]).await
     }
