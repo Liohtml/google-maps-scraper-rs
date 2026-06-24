@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format is based on
   at a fixed, easily-detected interval.
 
 ### Changed
+- `Cargo.toml` now sets `publish = false` to prevent an accidental `cargo publish`
+  to crates.io before the crate is intentionally released.
 - `search_many_on_page` now uses plain `Vec` / `HashSet` instead of
   `Arc<Mutex<…>>`; the function is single-task, so the async locks and the
   never-taken `Arc::try_unwrap` panic path were pure overhead.
