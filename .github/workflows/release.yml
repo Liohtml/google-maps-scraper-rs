@@ -1,0 +1,112 @@
+# Release: push a tag `vX.Y.Z` (matching the version in Cargo.toml) to
+# verify, publish to crates.io, and create a GitHub release.
+#
+# Requires the repository secret CARGO_REGISTRY_TOKEN — a crates.io API token
+# with the "publish-new" / "publish-update" scopes for this crate
+# (create one at https://crates.io/settings/tokens).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify tag & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@400e7407cfd7a091e5fbb6afec01ec146c432b7c # v2.7.7
+      # Guard against tagging a commit whose Cargo.toml carries a different
+      # version: crates.io is append-only, so publishing the wrong version
+      # cannot be undone (only yanked).
+      - name: Check tag matches Cargo.toml version
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --verbose
+      - name: Package (dry run)
+        run: cargo publish --dry-run
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@400e7407cfd7a091e5fbb6afec01ec146c432b7c # v2.7.7
+      # Idempotent: if this version is already on crates.io (e.g. published
+      # manually, or the job is being re-run), skip instead of failing so the
+      # GitHub-release job downstream still runs.
+      - name: Publish
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsS "https://index.crates.io/go/og/google-maps-scraper" | grep -q "\"vers\":\"${version}\""; then
+            echo "google-maps-scraper ${version} is already on crates.io — skipping publish"
+            exit 0
+          fi
+          cargo publish --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    name: create GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # Extract this version's section from CHANGELOG.md as the release notes.
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! [ -s release-notes.md ]; then
+            echo "No CHANGELOG section found for $version — see CHANGELOG.md." > release-notes.md
+          fi
+      # Idempotent: if a release for this tag already exists (created manually
+      # in the UI, or the job is being re-run), skip instead of failing on
+      # "Release.tag_name already exists".
+      - name: Create release
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists — skipping creation"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

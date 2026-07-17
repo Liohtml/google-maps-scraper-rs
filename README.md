@@ -1,9 +1,9 @@
 # google-maps-scraper
 
+[![crates.io](https://img.shields.io/crates/v/google-maps-scraper.svg)](https://crates.io/crates/google-maps-scraper)
+[![docs.rs](https://img.shields.io/docsrs/google-maps-scraper)](https://docs.rs/google-maps-scraper)
 [![CI](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-
-> **Note:** This crate is not yet published on crates.io. Install it from git (see below).
 
 Apify-style Google Maps scraper for Rust. Drives a real headless Chrome via the Chrome DevTools Protocol — no API key required.
 
@@ -34,7 +34,7 @@ Until now there has been **no production-quality Rust crate** for scraping Googl
 
 ```toml
 [dependencies]
-google-maps-scraper = { git = "https://github.com/Liohtml/google-maps-scraper-rs" }
+google-maps-scraper = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -86,9 +86,11 @@ let cfg = ScraperConfig {
     enrich: true,                          // click each place for website/phone
     between_query_delay: Duration::from_secs(3),
     place_panel_delay: Duration::from_millis(2000),
+    place_panel_jitter: Duration::from_millis(750), // random extra 0..=750ms per place
     max_places: Some(50),                  // cap unique places per query (None = unlimited)
     nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
     proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var
+    user_agent: None,                      // None = Chrome's own current UA (recommended)
     browserless_url: None,                 // or set BROWSERLESS_URL to use a remote Chrome
 };
 let scraper = MapsScraper::launch(cfg).await?;
@@ -127,8 +129,8 @@ size, user agent) are controlled by the remote endpoint — configure those ther
 pub struct Place {
     pub name: String,
     pub address: Option<String>,
-    pub postcode: Option<String>,        // German format detection
-    pub city: Option<String>,
+    pub postcode: Option<String>,        // "NNNNN City" (German postal format); else None
+    pub city: Option<String>,            // parsed alongside postcode; else None
     pub phone: Option<String>,
     pub website: Option<String>,
     pub maps_url: Option<String>,

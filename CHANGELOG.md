@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- `Place::rating`, `Place::reviews_count`, `Place::category` — extracted from the detail
+  panel, with unit-tested `parse_rating` / `parse_reviews_count` helpers (locale-tolerant).
+
+## [0.3.0] - 2026-07-17
+
+First release published to **crates.io**: install with
+`google-maps-scraper = "0.3"`. Earlier versions were git-only.
+
+### Added
+- `ScraperConfig::place_panel_jitter` — random extra delay (default `0..=750 ms`)
+  added before each place visit so the enrich path no longer makes navigations
+  at a fixed, easily-detected interval. **Breaking** for code that constructs
+  `ScraperConfig` exhaustively (without `..Default::default()`) — hence the
+  0.x minor bump.
+- Release automation: pushing a `v*` tag now verifies the tag matches the crate
+  version, runs the full check suite, publishes to crates.io, and creates a
+  GitHub release (`.github/workflows/release.yml`).
+
+### Changed
+- `Cargo.toml`: the temporary `publish = false` guard (added while the crate was
+  git-only) is removed for this deliberate crates.io release, and the
+  `documentation` field now points at docs.rs.
+- `search_many_on_page` now uses plain `Vec` / `HashSet` instead of
+  `Arc<Mutex<…>>`; the function is single-task, so the async locks and the
+  never-taken `Arc::try_unwrap` panic path were pure overhead.
+- `MapsScraper::search` documents that each call opens/closes a tab and
+  `search_many` should be preferred for multiple queries.
+- `ScraperConfig::max_places` documents that `None` is truly unbounded (one
+  navigation per place, no time bound).
+- README installation instructions point at crates.io instead of the git
+  dependency.
+
+## [0.2.0] - 2026-06-15
+
+### Added
 - `Drop` implementation for `MapsScraper` so the CDP handler task is aborted
   even when `close()` is not called (panic / early return).
 - `ScraperConfig::max_places` — cap the number of unique places returned per query.
@@ -14,11 +49,20 @@ All notable changes to this project are documented here. The format is based on
 - `ScraperConfig::browserless_url` (and `BROWSERLESS_URL` env fallback) — connect to a
   remote Chrome over the DevTools WebSocket instead of launching a local browser.
 - `Place::latitude` / `Place::longitude` — parsed from the `@lat,lng` segment of `maps_url`.
-- `Place::rating`, `Place::reviews_count`, `Place::category` — extracted from the detail
-  panel, with unit-tested `parse_rating` / `parse_reviews_count` helpers (locale-tolerant).
+- `ScraperConfig::user_agent` — optional `User-Agent` override.
 - GitHub Actions CI: build, test, and clippy on push / pull request.
+- CI now runs `cargo audit` to scan dependencies for known security advisories.
 
 ### Changed
+- The hardcoded (and stale, macOS-specific) Chrome user-agent is no longer set
+  by default. Chrome now reports its own current UA unless `user_agent` is set,
+  avoiding a UA/TLS-fingerprint and UA/host-OS mismatch.
+- Headless runs now use Chrome's **new** headless mode (`--headless=new`)
+  instead of the old `--headless`, so the reported user-agent no longer contains
+  the `HeadlessChrome` bot-detection token.
+- The proxy value (`proxy` / `PROXY_URL`) is now rejected at launch if it
+  contains whitespace (a malformed value Chrome would silently ignore, falling
+  back to a direct connection and leaking the real IP).
 - Page navigations are wrapped in `tokio::time::timeout` and fail with a clear
   error instead of hanging indefinitely.
 - Collected feed URLs are filtered to the `https://` scheme before navigation,
@@ -29,6 +73,17 @@ All notable changes to this project are documented here. The format is based on
 ### Fixed
 - The working tab opened in `search_many` is now closed before returning,
   fixing a tab/memory leak when a scraper is reused for many searches.
+- The working tab is now closed even when the run returns early with an error
+  (e.g. the initial Maps navigation fails), not only on the success path.
+- Each place detail now waits (bounded) for the panel `<h1>` to render before
+  extraction, in addition to the fixed settle delay — reduces empty `Place`s on
+  slow renders.
+- The enrich path now skips a place URL it has already visited *before*
+  navigating, and registers every visited URL (including ones whose extraction
+  failed), avoiding wasted navigations for exact-duplicate URLs within and
+  across queries. (Distinct URLs sharing one website domain are still
+  deduplicated, but only after navigation, since the domain is read from the
+  loaded panel.)
 
 ## [0.1.0] - 2026-05-02
 
@@ -42,3 +97,9 @@ All notable changes to this project are documented here. The format is based on
 - `Place` — structured output with name, address, postcode, city, phone, website, maps_url.
 - German postcode/city parsing via `parse_german_address`.
 - Cookie consent auto-dismiss for German and English Google interfaces.
+
+<!-- Version links resolve once the matching git tags are pushed. -->
+[Unreleased]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Liohtml/google-maps-scraper-rs/releases/tag/v0.1.0
