@@ -98,7 +98,15 @@ jobs:
           if ! [ -s release-notes.md ]; then
             echo "No CHANGELOG section found for $version — see CHANGELOG.md." > release-notes.md
           fi
+      # Idempotent: if a release for this tag already exists (created manually
+      # in the UI, or the job is being re-run), skip instead of failing on
+      # "Release.tag_name already exists".
       - name: Create release
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --verify-tag
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists — skipping creation"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
