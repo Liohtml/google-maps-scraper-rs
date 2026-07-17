@@ -1,9 +1,9 @@
 # google-maps-scraper
 
+[![crates.io](https://img.shields.io/crates/v/google-maps-scraper.svg)](https://crates.io/crates/google-maps-scraper)
+[![docs.rs](https://img.shields.io/docsrs/google-maps-scraper)](https://docs.rs/google-maps-scraper)
 [![CI](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Liohtml/google-maps-scraper-rs/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-
-> **Note:** This crate is not yet published on crates.io. Install it from git (see below).
 
 Apify-style Google Maps scraper for Rust. Drives a real headless Chrome via the Chrome DevTools Protocol — no API key required.
 
@@ -34,7 +34,7 @@ Until now there has been **no production-quality Rust crate** for scraping Googl
 
 ```toml
 [dependencies]
-google-maps-scraper = { git = "https://github.com/Liohtml/google-maps-scraper-rs" }
+google-maps-scraper = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
