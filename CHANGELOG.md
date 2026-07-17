@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- `Place::rating`, `Place::reviews_count`, `Place::category` — extracted from the detail
+  panel, with unit-tested `parse_rating` / `parse_reviews_count` helpers (locale-tolerant).
+
 ## [0.3.0] - 2026-07-17
 
 First release published to **crates.io**: install with
