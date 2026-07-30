@@ -5,9 +5,32 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-29
+
+**Breaking release** (see the SemVer note under *Changed*). Upgrade path: build
+`ScraperConfig` via `ScraperConfig::default()` + field mutation instead of a
+struct literal, and add a wildcard arm to any exhaustive `match` on `Error`.
+
 ### Added
 - `Place::rating`, `Place::reviews_count`, `Place::category` — extracted from the detail
   panel, with unit-tested `parse_rating` / `parse_reviews_count` helpers (locale-tolerant).
+- `Place::place_id` / `Place::cid` — stable Google identifiers parsed from the
+  place URL's `data=` blob (no extra navigation, no new DOM selectors). Use them
+  for cross-run deduplication or joining against the official Places API. Feed
+  URLs don't always carry the `!19s` Place-ID segment, so `cid` is the more
+  reliably present of the two.
+- `ScraperConfig::language` — pins the Google Maps UI language via the `hl=`
+  query parameter on every navigation (default `Some("en")`). Previously the UI
+  language followed the exit IP's geo, silently breaking label-based extraction
+  (address/phone prefixes, rating/review keywords, consent buttons) behind
+  non-EN/DE proxies. Set to `None` for the old geo-dependent behavior.
+
+### Changed
+- **Breaking:** `Place`, `ScraperConfig`, and `Error` are now `#[non_exhaustive]`.
+  Future `Option<T>` fields and error variants can then land in *minor* releases
+  instead of forcing a breaking bump each time. `ScraperConfig` is constructed
+  via `default()` + field mutation (fields stay public); `Place` is output-only;
+  exhaustive `match`es on `Error` need a `_` arm.
 
 ## [0.3.0] - 2026-07-17
 
@@ -99,7 +122,8 @@ First release published to **crates.io**: install with
 - Cookie consent auto-dismiss for German and English Google interfaces.
 
 <!-- Version links resolve once the matching git tags are pushed. -->
-[Unreleased]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Liohtml/google-maps-scraper-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Liohtml/google-maps-scraper-rs/releases/tag/v0.1.0

@@ -34,7 +34,7 @@ Until now there has been **no production-quality Rust crate** for scraping Googl
 
 ```toml
 [dependencies]
-google-maps-scraper = "0.3"
+google-maps-scraper = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -75,27 +75,35 @@ Results are automatically deduplicated by website domain (or maps URL when no we
 
 ## Configuration
 
+`ScraperConfig` is `#[non_exhaustive]` (new options arrive without breaking you),
+so start from `default()` and set what you need:
+
 ```rust,no_run
 # use google_maps_scraper::{MapsScraper, ScraperConfig};
 # use std::time::Duration;
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-let cfg = ScraperConfig {
-    headless: false,                       // see Chrome window for debugging
-    max_scroll_iterations: 50,             // load more results
-    enrich: true,                          // click each place for website/phone
-    between_query_delay: Duration::from_secs(3),
-    place_panel_delay: Duration::from_millis(2000),
-    place_panel_jitter: Duration::from_millis(750), // random extra 0..=750ms per place
-    max_places: Some(50),                  // cap unique places per query (None = unlimited)
-    nav_timeout: Duration::from_secs(30),  // fail instead of hanging on a stalled page
-    proxy: Some("http://user:pass@host:port".into()), // or set the PROXY_URL env var
-    user_agent: None,                      // None = Chrome's own current UA (recommended)
-    browserless_url: None,                 // or set BROWSERLESS_URL to use a remote Chrome
-};
+let mut cfg = ScraperConfig::default();
+cfg.headless = false;                       // see Chrome window for debugging
+cfg.max_scroll_iterations = 50;             // load more results
+cfg.enrich = true;                          // click each place for website/phone
+cfg.between_query_delay = Duration::from_secs(3);
+cfg.place_panel_delay = Duration::from_millis(2000);
+cfg.place_panel_jitter = Duration::from_millis(750); // random extra 0..=750ms per place
+cfg.max_places = Some(50);                  // cap unique places per query (None = unlimited)
+cfg.nav_timeout = Duration::from_secs(30);  // fail instead of hanging on a stalled page
+cfg.proxy = Some("http://user:pass@host:port".into()); // or set the PROXY_URL env var
+cfg.user_agent = None;                      // None = Chrome's own current UA (recommended)
+cfg.browserless_url = None;                 // or set BROWSERLESS_URL to use a remote Chrome
+cfg.language = Some("en".into());           // pin the Maps UI language (default "en")
 let scraper = MapsScraper::launch(cfg).await?;
 # Ok(()) }
 ```
+
+The `language` option pins Google's UI language via the `hl=` parameter on every
+navigation. Without it Google picks the language from your exit IP's geo — which
+silently breaks label-based extraction behind non-EN/DE proxies. Leave it at the
+default unless you have a reason not to.
 
 Set `enrich: false` for a 5–10× speedup if you only need names + maps URLs (no website / phone).
 
@@ -136,12 +144,18 @@ pub struct Place {
     pub maps_url: Option<String>,
     pub latitude: Option<f64>,           // parsed from the maps_url @lat,lng segment
     pub longitude: Option<f64>,
+    pub place_id: Option<String>,        // stable Google Place ID (cross-run dedup,
+                                         // joins against the official Places API)
+    pub cid: Option<u64>,                // stable Google CID (maps.google.com/?cid=…)
     pub rating: Option<f32>,             // average star rating (0.0–5.0)
     pub reviews_count: Option<u32>,      // number of reviews
     pub category: Option<String>,        // primary business category
     pub source_query: Option<String>,
 }
 ```
+
+(`Place` is `#[non_exhaustive]` — new optional fields arrive in minor releases
+without breaking your build.)
 
 `Place` derives `Serialize` + `Deserialize` so you can write straight to JSONL.
 
@@ -176,6 +190,8 @@ The crate ships with the most reliable selectors at the time of writing. Google'
 - ✅ Coordinates (`latitude` / `longitude`) parsed from the maps URL.
 - ✅ Remote Chrome (Browserless) support via `ScraperConfig::browserless_url` / `BROWSERLESS_URL`.
 - ✅ Richer place data: rating, review count, category.
+- ✅ Stable identifiers (`place_id` / `cid`) for cross-run dedup and Places-API joins.
+- ✅ Deterministic UI language via `ScraperConfig::language` (`hl=` pinning).
 - Headed-mode debugging helper that opens DevTools.
 - Opening hours extraction.
 - Concurrent multi-page scraping inside one browser.

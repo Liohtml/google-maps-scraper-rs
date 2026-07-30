@@ -61,7 +61,11 @@ use tracing::{info, warn};
 const SEARCH_URL_BASE: &str = "https://www.google.com/maps";
 
 /// All errors this crate produces.
+///
+/// Marked `#[non_exhaustive]`: new error variants may be added in minor
+/// releases, so `match` arms outside this crate need a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Chrome failed to launch (often: not installed, or missing libs on Linux).
     #[error("chrome launch failed: {0}")]
@@ -84,7 +88,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// One Google Maps place that the scraper extracted.
+///
+/// Marked `#[non_exhaustive]`: new (always `Option<T>`) fields may be added in
+/// minor releases. `Place` is an output type — read its fields; it cannot be
+/// constructed outside this crate.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct Place {
     /// Display name (from H1 on the detail panel).
     pub name: String,
@@ -109,9 +118,25 @@ pub struct Place {
     pub latitude: Option<f64>,
     /// Longitude parsed from the `@lat,lng` segment of `maps_url`, if present.
     pub longitude: Option<f64>,
+    /// Google **Place ID** (e.g. `ChIJN1t_tDeuEmsRUsoyG83frY4`) parsed from
+    /// the `!19s…` segment of `maps_url`, if present. Stable across runs and
+    /// viewports — use it to dedupe between scrapes or join against the
+    /// official Places API.
+    pub place_id: Option<String>,
+    /// Google **CID** (customer/listing id, the decimal form of the second
+    /// half of the `0x…:0x…` pair in `maps_url`), if present. Also stable;
+    /// `https://maps.google.com/?cid=<CID>` resolves to the listing.
+    pub cid: Option<u64>,
     /// Average star rating (0.0–5.0) from the detail panel, if shown.
     pub rating: Option<f32>,
     /// Number of reviews backing the rating, if shown.
+    ///
+    /// Live-validated 2026-07-30: Google's current detail-panel layout does
+    /// not render a review count next to the rating for most listings (only
+    /// the star value and a "Write a review" button remain visible without
+    /// opening the reviews list), so this is frequently `None` today even
+    /// when [`Place::rating`] is populated. The extraction still tries
+    /// several selectors in case a locale/listing type shows it inline.
     pub reviews_count: Option<u32>,
     /// Primary business category (e.g. "Bakery"), if shown.
     pub category: Option<String>,
@@ -120,7 +145,20 @@ pub struct Place {
 }
 
 /// Scraper configuration.
+///
+/// Marked `#[non_exhaustive]`: new fields may be added in minor releases, so
+/// the struct cannot be built with a literal outside this crate. Start from
+/// [`ScraperConfig::default()`] and mutate the (public) fields:
+///
+/// ```
+/// use google_maps_scraper::ScraperConfig;
+///
+/// let mut cfg = ScraperConfig::default();
+/// cfg.headless = false;
+/// cfg.max_places = Some(50);
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ScraperConfig {
     /// Run Chrome in headless mode (default: true). Use `false` for debugging.
     pub headless: bool,
@@ -173,6 +211,18 @@ pub struct ScraperConfig {
     /// launch arguments (`headless`, `proxy`, window size, user agent) are
     /// controlled by the remote endpoint and ignored here.
     pub browserless_url: Option<String>,
+    /// Google Maps **UI language**, sent as the `hl=` query parameter on every
+    /// navigation. Default: `Some("en")`.
+    ///
+    /// Google normally picks the UI language from the exit IP's geo — so a
+    /// scraper behind e.g. a French proxy silently gets French labels, which
+    /// breaks the label-based extraction (address/phone prefixes, rating and
+    /// review keywords, consent buttons are matched in EN/DE only). Pinning
+    /// `hl` makes extraction deterministic regardless of proxy geo.
+    ///
+    /// Set to `None` to restore the geo-dependent behavior (not recommended
+    /// unless you know your exit geo serves EN or DE).
+    pub language: Option<String>,
 }
 
 impl Default for ScraperConfig {
@@ -189,6 +239,7 @@ impl Default for ScraperConfig {
             proxy: None,
             user_agent: None,
             browserless_url: None,
+            language: Some("en".to_string()),
         }
     }
 }
@@ -232,15 +283,22 @@ impl MapsScraper {
                 .await
                 .map_err(|e| Error::ChromeLaunch(e.to_string()))?
         } else {
+            // NOTE: chromiumoxide's `arg()` takes a *bare* flag name (or a
+            // `(key, value)` tuple) and prepends the `--` itself — passing an
+            // already-dashed string like `"--proxy-server=…"` double-prefixes
+            // it to `"----proxy-server=…"`, which Chrome silently ignores as
+            // an unrecognized flag. That previously made `proxy`/`user_agent`/
+            // the anti-detection flags all no-ops. Always pass bare keys /
+            // (key, value) tuples here, never a leading `--`.
             let mut builder = BrowserConfig::builder()
-                .arg("--lang=en-US,en")
-                .arg("--no-first-run")
-                .arg("--no-default-browser-check")
-                .arg("--disable-blink-features=AutomationControlled")
-                .arg("--window-size=1280,1024");
+                .arg(("lang", "en-US,en"))
+                .arg("no-first-run")
+                .arg("no-default-browser-check")
+                .arg(("disable-blink-features", "AutomationControlled"))
+                .arg(("window-size", "1280,1024"));
             // Only override the UA when explicitly configured (see field docs).
             if let Some(ua) = cfg.user_agent.as_deref().filter(|u| !u.is_empty()) {
-                builder = builder.arg(format!("--user-agent={ua}"));
+                builder = builder.arg(("user-agent", ua));
             }
             // Use Chrome's *new* headless mode when headless: unlike the old
             // `--headless`, it reports a normal, current user-agent with no
@@ -260,7 +318,7 @@ impl MapsScraper {
             {
                 check_proxy(&proxy)?;
                 info!(server = %redact_url(&proxy), "using proxy server");
-                builder = builder.arg(format!("--proxy-server={proxy}"));
+                builder = builder.arg(("proxy-server", proxy.as_str()));
             }
             let browser_cfg = builder
                 .build()
@@ -310,8 +368,10 @@ impl MapsScraper {
     }
 
     async fn search_many_on_page(&self, page: &Page, queries: &[&str]) -> Result<Vec<Place>> {
+        let lang = self.cfg.language.as_deref().filter(|l| !l.is_empty());
         // Visit the maps homepage once to handle the consent banner.
-        goto_with_timeout(page, "https://www.google.com/maps", self.cfg.nav_timeout).await?;
+        let home = with_language("https://www.google.com/maps", lang);
+        goto_with_timeout(page, &home, self.cfg.nav_timeout).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = dismiss_consent(page).await;
 
@@ -323,7 +383,10 @@ impl MapsScraper {
 
         for (i, q) in queries.iter().enumerate() {
             info!(progress = i + 1, total = queries.len(), query = %q, "scanning");
-            let url = format!("{}/search/{}/", SEARCH_URL_BASE, urlencoding::encode(q));
+            let url = with_language(
+                &format!("{}/search/{}/", SEARCH_URL_BASE, urlencoding::encode(q)),
+                lang,
+            );
             if let Err(e) = goto_with_timeout(page, &url, self.cfg.nav_timeout).await {
                 warn!("goto error: {e}");
                 continue;
@@ -358,11 +421,14 @@ impl MapsScraper {
                     }
                     if seen_keys.insert(u.clone()) {
                         let (latitude, longitude) = parse_coords_from_maps_url(&u);
+                        let (place_id, cid) = parse_place_id_from_maps_url(&u);
                         out.push(Place {
                             name: String::new(),
                             maps_url: Some(u),
                             latitude,
                             longitude,
+                            place_id,
+                            cid,
                             source_query: Some((*q).to_string()),
                             ..Default::default()
                         });
@@ -381,7 +447,11 @@ impl MapsScraper {
                 if seen_keys.contains(&place_url) {
                     continue;
                 }
-                if let Err(e) = goto_with_timeout(page, &place_url, self.cfg.nav_timeout).await {
+                // Navigate with the pinned UI language; keep `place_url` itself
+                // untouched so dedup keys and `Place::maps_url` are stable across
+                // language configs.
+                let nav_url = with_language(&place_url, lang);
+                if let Err(e) = goto_with_timeout(page, &nav_url, self.cfg.nav_timeout).await {
                     warn!("place goto: {e}");
                     continue;
                 }
@@ -418,6 +488,7 @@ impl MapsScraper {
                 let (postcode, city) =
                     parse_german_address(detail.address.as_deref().unwrap_or(""));
                 let (latitude, longitude) = parse_coords_from_maps_url(&place_url);
+                let (place_id, cid) = parse_place_id_from_maps_url(&place_url);
                 out.push(Place {
                     name: detail.name.unwrap_or_default(),
                     address: detail.address,
@@ -428,6 +499,8 @@ impl MapsScraper {
                     maps_url: Some(place_url),
                     latitude,
                     longitude,
+                    place_id,
+                    cid,
                     rating: detail.rating,
                     reviews_count: detail.reviews_count,
                     category: detail.category,
@@ -617,14 +690,24 @@ async fn extract_place_details(page: &Page) -> Result<PlaceDetailRaw> {
             out.rating = ratingText;
 
             // Review count: prefer an element whose aria-label mentions reviews
-            // (keeps it separate from the rating), else a parenthesised count.
+            // (keeps it separate from the rating), else a parenthesised count
+            // next to the rating, else a "<N> reviews" phrase anywhere in the
+            // panel. As of 2026-07 Google's default detail-panel layout does
+            // not render any of these next to the rating for most listings
+            // (only "Write a review" remains) - this is a best-effort chain
+            // kept for locales/listing types that still show it, not a
+            // guaranteed hit. See CHANGELOG / Place::reviews_count docs.
             let reviewsText = null;
             const revEl = document.querySelector(
                 'button[aria-label*="review" i], button[aria-label*="Rezension" i], button[aria-label*="Bewertung" i], [aria-label*="reviews" i]'
             );
             if (revEl) reviewsText = revEl.getAttribute('aria-label');
             if (!reviewsText && head) {
-                const m = head.textContent.match(/\(([\d.,   ]+)\)/);
+                const m = head.textContent.match(/\(([\d.,   ]+)\)/);
+                if (m) reviewsText = m[1];
+            }
+            if (!reviewsText) {
+                const m = document.body.innerText.match(/([\d.,   ]+)\s+reviews?/i);
                 if (m) reviewsText = m[1];
             }
             out.reviews = reviewsText;
@@ -743,6 +826,44 @@ fn parse_coords_from_maps_url(url: &str) -> (Option<f64>, Option<f64>) {
     (None, None)
 }
 
+/// Append Google's `hl=<lang>` UI-language parameter to `url`. Returns the URL
+/// unchanged when `lang` is `None` or when it already carries an `hl=` param
+/// (never double up — Google keeps the first one anyway).
+fn with_language(url: &str, lang: Option<&str>) -> String {
+    let Some(lang) = lang else {
+        return url.to_string();
+    };
+    if url.contains("?hl=") || url.contains("&hl=") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}hl={}", urlencoding::encode(lang))
+}
+
+/// Parse the stable identifiers Google embeds in a place URL's `data=` blob:
+/// the **Place ID** from a `!19s<id>` segment and the **CID** from the second
+/// half of a `!1s0x…:0x…` feature pair (hex → decimal).
+///
+/// Feed URLs usually carry the `0x…:0x…` pair but not always the `!19s`
+/// segment, so `cid` is the more reliably present of the two. Returns `None`
+/// for whatever is absent — per crate convention this never fails extraction.
+fn parse_place_id_from_maps_url(url: &str) -> (Option<String>, Option<u64>) {
+    static PLACE_ID_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"!19s([A-Za-z0-9_-]{16,})").unwrap());
+    static CID_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"!1s0x[0-9a-fA-F]+:0x([0-9a-fA-F]+)").unwrap());
+    let place_id = PLACE_ID_RE
+        .captures(url)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+    let cid = CID_RE
+        .captures(url)
+        .and_then(|c| c.get(1))
+        .and_then(|m| u64::from_str_radix(m.as_str(), 16).ok())
+        .filter(|&v| v != 0);
+    (place_id, cid)
+}
+
 /// Parse a star rating out of a label such as `"4,5"`, `"4.5"`, `"4.5 stars"`
 /// or `"4,5 Sterne"`. Accepts `,` or `.` as the decimal separator and only
 /// returns values within the valid 0.0–5.0 range.
@@ -848,6 +969,61 @@ mod tests {
         assert!(c.user_agent.is_none());
         assert!(c.browserless_url.is_none());
         assert_eq!(c.place_panel_jitter, Duration::from_millis(750));
+        assert_eq!(c.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn with_language_appends_hl() {
+        assert_eq!(
+            with_language("https://www.google.com/maps", Some("en")),
+            "https://www.google.com/maps?hl=en"
+        );
+        // Existing query string → appended with '&'.
+        assert_eq!(
+            with_language("https://maps.google.com/place/X?authuser=0", Some("en")),
+            "https://maps.google.com/place/X?authuser=0&hl=en"
+        );
+        // An hl= already present (ours or Google's) is left alone.
+        assert_eq!(
+            with_language("https://www.google.com/maps?hl=de", Some("en")),
+            "https://www.google.com/maps?hl=de"
+        );
+        // No language configured → untouched.
+        assert_eq!(
+            with_language("https://www.google.com/maps", None),
+            "https://www.google.com/maps"
+        );
+        // Language values are encoded, not injected verbatim.
+        assert_eq!(
+            with_language("https://www.google.com/maps", Some("a&b=c")),
+            "https://www.google.com/maps?hl=a%26b%3Dc"
+        );
+    }
+
+    #[test]
+    fn parses_place_id_and_cid() {
+        // Full detail-panel URL: both !19s place id and 0x…:0x… pair present.
+        let url = "https://www.google.com/maps/place/X/@52.5,13.4,17z/data=!3m1!4b1!4m6!3m5!1s0x47a851ec8b01ab0d:0x421bec8e3d4d2d4a!8m2!3d52.5!4d13.4!19sChIJN1t_tDeuEmsRUsoyG83frY4";
+        let (pid, cid) = parse_place_id_from_maps_url(url);
+        assert_eq!(pid.as_deref(), Some("ChIJN1t_tDeuEmsRUsoyG83frY4"));
+        assert_eq!(cid, Some(0x421bec8e3d4d2d4a));
+
+        // Feed URLs often carry only the feature pair (no !19s).
+        let feed =
+            "https://www.google.com/maps/place/Y/data=!4m2!3m1!1s0x47a851ec8b01ab0d:0xdeadbeef";
+        let (pid, cid) = parse_place_id_from_maps_url(feed);
+        assert_eq!(pid, None);
+        assert_eq!(cid, Some(0xdead_beef));
+
+        // A zero CID is noise, not an identifier.
+        let zero = "https://www.google.com/maps/place/Z/data=!1s0x0:0x0";
+        assert_eq!(parse_place_id_from_maps_url(zero), (None, None));
+
+        // No data blob at all.
+        assert_eq!(
+            parse_place_id_from_maps_url("https://example.com/no-data"),
+            (None, None)
+        );
     }
 
     #[test]
